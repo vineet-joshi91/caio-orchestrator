@@ -62,7 +62,7 @@ except Exception:
     contact_router = None
 
 # ---- Brains (registry + your engine adapter lives behind each brain) ----
-from caio_brains.registry import brain_registry
+from brains.registry import brain_registry
 
 # ------------------------------------------------------------------------------
 # App + CORS
