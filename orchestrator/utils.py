@@ -2,7 +2,7 @@
 import time, hmac, hashlib, base64, json
 from typing import Optional, Dict
 from datetime import datetime, timedelta
-from .settings import settings
+from caio_core.settings import settings
 
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
