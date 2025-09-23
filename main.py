@@ -12,11 +12,27 @@ import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
+import io
 
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Request, Query
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Request, Query, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from caio_core.aggregation.brain_aggregator import aggregate_brain_outputs
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+try:
+    import docx  # python-docx
+except Exception:
+    docx = None
+
+import httpx  # used to call our own FastAPI app internally
 
 # ---- core settings / schemas / utils (your files) ----
 from caio_core.settings import settings  # APP_NAME, VERSION, CORS_ORIGINS, JWT_EXPIRE_MINUTES
@@ -222,6 +238,122 @@ def _public_config_from_env() -> Dict[str, Any]:
         "limits": limits,
     }
 
+def _safe_head(df, n=20):
+    try:
+        return df.head(n).to_markdown(index=False)
+    except Exception:
+        return df.head(n).to_string(index=False)
+
+async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
+    """
+    Best-effort text extraction. Works even if some libs are missing.
+    Limits per-file bytes/pages to keep request small.
+    """
+    if not files:
+        return ""
+    chunks: List[str] = []
+    for f in files:
+        name = (f.filename or "file").strip()
+        lower = name.lower()
+        try:
+            raw = await f.read()
+        except Exception:
+            continue
+
+        # cap size (~3MB) to avoid memory/token blowups
+        if len(raw) > 3_000_000:
+            raw = raw[:3_000_000]
+
+        # PDF
+        if lower.endswith(".pdf") and PdfReader is not None:
+            try:
+                reader = PdfReader(io.BytesIO(raw))
+                pages = min(len(reader.pages), 10)
+                text = []
+                for i in range(pages):
+                    text.append(reader.pages[i].extract_text() or "")
+                chunks.append(f"\n\n# [PDF] {name}\n" + "\n".join(text))
+                continue
+            except Exception:
+                pass
+
+        # DOCX
+        if lower.endswith(".docx") and docx is not None:
+            try:
+                d = docx.Document(io.BytesIO(raw))
+                text = "\n".join([p.text for p in d.paragraphs if p.text.strip()])[:15000]
+                chunks.append(f"\n\n# [DOCX] {name}\n{text}")
+                continue
+            except Exception:
+                pass
+
+        # CSV
+        if lower.endswith(".csv") and pd is not None:
+            try:
+                df = pd.read_csv(io.BytesIO(raw))
+                preview = _safe_head(df)
+                try:
+                    desc = df.describe(include="all").to_markdown()
+                except Exception:
+                    desc = ""
+                chunks.append(f"\n\n# [CSV] {name}\n## preview\n{preview}\n\n## describe\n{desc}")
+                continue
+            except Exception:
+                pass
+
+        # XLS/XLSX
+        if (lower.endswith(".xlsx") or lower.endswith(".xls")) and pd is not None:
+            try:
+                excel = pd.ExcelFile(io.BytesIO(raw))
+                sheet_names = excel.sheet_names[:5]
+                parts = [f"Sheets: {', '.join(sheet_names)}"]
+                for s in sheet_names:
+                    df = excel.parse(s)
+                    preview = _safe_head(df)
+                    parts.append(f"\n### sheet: {s}\n{preview}")
+                chunks.append(f"\n\n# [XLSX] {name}\n" + "\n".join(parts))
+                continue
+            except Exception:
+                pass
+
+        # TXT / fallback
+        try:
+            txt = raw.decode("utf-8", errors="ignore")[:20000]
+            chunks.append(f"\n\n# [TEXT] {name}\n{txt}")
+        except Exception:
+            pass
+
+    return "\n".join(chunks).strip()
+
+def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
+    """
+    Convert /api/analyze JSON into the CXO markdown your chat UI expects.
+    - Collective Insights (top)
+    - Then ## CFO/CHRO/COO/CMO/CPO with ### Recommendations bullets
+    """
+    lines: List[str] = []
+
+    ci = resp.get("collective_insights") or []
+    if ci:
+        lines.append("## Collective Insights")
+        for i, item in enumerate(ci[:10], 1):
+            lines.append(f"{i}. {item}")
+        lines.append("")
+
+    recs = (resp.get("cxo_recommendations") or {})
+    for role in ["CFO", "CHRO", "COO", "CMO", "CPO"]:
+        rlist = recs.get(role) or []
+        lines.append(f"## {role}")
+        if rlist:
+            lines.append("### Recommendations")
+            for i, r in enumerate(rlist, 1):
+                lines.append(f"{i}. {r}")
+        else:
+            lines.append("_No recommendations._")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
 # ------------------------------------------------------------------------------
 # API router (prefix=/api) — matches your FE
 # ------------------------------------------------------------------------------
@@ -271,8 +403,7 @@ def api_login(body: AuthLogin, db=Depends(get_db)):
 
 @api.get("/profile", response_model=Me)
 def api_profile(current: User = Depends(get_current_user)):
-    # compute tier from DB, then upgrade to "premium" for admins
-    tier_val = (getattr(current, "plan_tier", None) or ("pro" if current.is_paid else "demo"))
+    tier_val = (getattr(current, "plan_tier", None) or ("pro" if getattr(current, "is_paid", False) else "demo"))
     if getattr(current, "is_admin", False):
         tier_val = "premium"
 
@@ -427,17 +558,13 @@ async def chat_send(
     current: User = Depends(get_current_user),
 ):
     """
-    Accepts multipart form:
-      - session_id: optional (if missing, create new session)
-      - message: optional (file-only allowed)
-      - files: optional, one or more files
-    Behavior:
-      - ensure session exists (create if needed)
-      - store a user message (with filenames note if any)
-      - return an assistant stub (replace with real LLM later)
+    - Accepts multipart (message + files)
+    - Ensures/creates a chat session
+    - Extracts useful text from files
+    - Calls our own /api/analyze internally for CXO output
+    - Returns assistant message containing CXO-formatted markdown
     """
-    # 1) ensure or create a session for this user
-    sess = None
+    # 1) ensure/create session
     if session_id:
         sess = (
             db.query(ChatSession)
@@ -448,44 +575,72 @@ async def chat_send(
             raise HTTPException(status_code=404, detail="Session not found")
     else:
         sess = ChatSession(user_id=current.id, title=None, created_at=datetime.utcnow())
-        db.add(sess); db.commit(); db.refresh(sess)
+        db.add(sess)
+        db.commit()
+        db.refresh(sess)
 
-    # 2) normalize user content
+    # 2) persist user message (with filenames note if any)
     msg_text = (message or "").strip()
-    file_names = []
-    if files:
-        for f in files:
-            try:
-                file_names.append(f.filename)
-                # If you want: read/save bytes, push to storage, etc.
-                # _ = await f.read()
-            except Exception:
-                pass
+    filenames = [f.filename for f in (files or []) if getattr(f, "filename", None)]
 
-    if not msg_text and not file_names:
+    if not msg_text and not filenames:
         raise HTTPException(status_code=400, detail="Provide a message or at least one file.")
 
     user_content = msg_text or "(file only)"
-    if file_names:
-        user_content += f"\n\n[files: {', '.join(file_names)}]"
+    if filenames:
+        user_content += f"\n\n[files: {', '.join(filenames)}]"
 
-    # 3) persist user message
     um = ChatMessage(session_id=sess.id, role="user", content=user_content, created_at=datetime.utcnow())
-    db.add(um); db.commit(); db.refresh(um)
+    db.add(um)
+    db.commit()
+    db.refresh(um)
 
-    # 4) assistant stub (swap with your brain/LLM pipeline as needed)
-    reply = "Received."
-    if file_names and not msg_text:
-        reply = f"Got {len(file_names)} file(s): {', '.join(file_names)}. Analyzing…"
-    elif file_names:
-        reply = f"Understood your request; also got {len(file_names)} file(s). Analyzing…"
-    elif msg_text:
-        reply = "On it. Analyzing…"
+    # 3) build analysis input: message + extracted file text
+    appendix = await _extract_text_from_files(files)
+    combined_text = (msg_text + "\n\n" + appendix).strip() if appendix else msg_text
 
+    # If truly nothing to analyze (e.g., only a binary we couldn't read), acknowledge
+    if not combined_text:
+        am = ChatMessage(
+            session_id=sess.id,
+            role="assistant",
+            content="Got your file(s). Please add a brief question/context to start analysis.",
+            created_at=datetime.utcnow(),
+        )
+        db.add(am); db.commit(); db.refresh(am)
+        return {
+            "session_id": sess.id,
+            "assistant": {
+                "id": am.id,
+                "role": am.role,
+                "content": am.content,
+                "created_at": am.created_at.isoformat() + "Z",
+            },
+        }
+
+    # 4) call our own /api/analyze internally (no external HTTP hop)
+    #    Treat admins as premium; otherwise use user's plan
+    tier_for_analysis = "premium" if getattr(current, "is_admin", False) else ("pro" if getattr(current, "is_paid", False) else "demo")
+    payload = {"text": combined_text, "tier": tier_for_analysis, "want_deep_dive": True}
+
+    try:
+        async with httpx.AsyncClient(app=app, base_url="http://internal") as client:
+            r = await client.post("/api/analyze", json=payload, timeout=120.0)
+        if not r.is_success:
+            body = r.text
+            raise RuntimeError(f"/api/analyze {r.status_code}: {body[:500]}")
+        analysis = r.json()
+        reply_md = _format_analyze_to_cxo_md(analysis)
+        reply = reply_md if reply_md.strip() else "No recommendations were generated."
+    except Exception as e:
+        # graceful fallback; still reply something
+        reply = f"Received {len(filenames)} file(s). Could not run full analysis.\n\nError: {e}"
+
+    # 5) store assistant message & respond
     am = ChatMessage(session_id=sess.id, role="assistant", content=reply, created_at=datetime.utcnow())
     db.add(am); db.commit(); db.refresh(am)
 
-    _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(file_names)}")
+    _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(filenames)}")
 
     return {
         "session_id": sess.id,
