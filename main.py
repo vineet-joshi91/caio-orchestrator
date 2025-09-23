@@ -10,6 +10,7 @@ CAIO Orchestrator Backend
 import os
 import io
 import csv
+import json
 import uuid
 import asyncio
 from datetime import datetime, timedelta
@@ -178,9 +179,9 @@ def _caps_for_tier(tier: str) -> Dict[str, int]:
     return _caps_for_tier("demo")
 
 def _public_config_from_env() -> Dict[str, Any]:
-    import json
+    import json as _json
     try:
-        pricing = json.loads(os.getenv("PRICING_JSON", "")) or {}
+        pricing = _json.loads(os.getenv("PRICING_JSON", "")) or {}
     except Exception:
         pricing = {}
     if not pricing:
@@ -403,7 +404,7 @@ async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
 
 def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
     """
-    Convert /api/analyze JSON into CXO markdown blocks the FE knows how to render.
+    Convert /api/analyze JSON into CXO markdown blocks the FE can display (fallback).
     """
     lines: List[str] = []
 
@@ -432,11 +433,63 @@ def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
 
     return "\n".join(lines).strip()
 
+def _build_structured_from_analysis(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize the analyze response into a compact structure the FE can consume.
+    """
+    combined = resp.get("combined") or {}
+    agg = combined.get("aggregate") or {}
+    collective = resp.get("collective_insights") or agg.get("collective") or agg.get("collective_insights") or []
+    by_role = resp.get("cxo_recommendations") or agg.get("recommendations_by_role") or {}
+
+    roles = ["CFO", "CHRO", "COO", "CMO", "CPO"]
+    return {
+        "render_version": "v2",
+        "collective_insights": list(collective or []),
+        "recommendations_by_role": {r: list(by_role.get(r) or []) for r in roles},
+    }
+
+def _fallback_recs(role: str, text: str) -> List[str]:
+    t = (text or "").lower()
+    recs: List[str] = []
+    if role == "CFO":
+        if any(k in t for k in ["p&l", "profit", "loss", "revenue", "margin"]):
+            recs += [
+                "Create a 13-week cash-flow with weekly variance tracking.",
+                "Shift 10–15% budget to highest ROI channels; freeze low-ROAS lines.",
+            ]
+        else:
+            recs += [
+                "Upload P&L, balance sheet, and cash ledger for last 12 months.",
+                "Define target runway and cost guardrails; propose a 90-day budget.",
+            ]
+    elif role == "COO":
+        recs += [
+            "Map top 5 bottlenecks (lead time, error rate, rework) with owners and SLAs.",
+            "Set a weekly ops dashboard; track throughput, defects, backlog, and SLA.",
+        ]
+    elif role == "CHRO":
+        recs += [
+            "Run a 9-box talent review and publish 2-role deep succession slates.",
+            "Launch quarterly performance calibration and simplify ratings to 3 bands.",
+        ]
+    elif role == "CMO":
+        recs += [
+            "Audit CAC/LTV by channel; reallocate 15% from bottom quartile to top.",
+            "Stand up a win/loss program and refresh ICP with 5 recent customer calls.",
+        ]
+    elif role == "CPO":
+        recs += [
+            "Define 3 business outcomes and map product bets to outcomes with owners.",
+            "Establish a discovery cadence (weekly) with 5 user interviews per cycle.",
+        ]
+    return recs
+
 @api.post("/analyze", response_model=AnalyzeResponse)
 def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get_current_user)):
     """
-    Run all brains on the provided content and aggregate.
-    Always return useful output, even if the aggregator returns nothing.
+    Run brains + aggregator. If aggregator or brains return nothing,
+    synthesize meaningful fallbacks so FE always renders content.
     """
     tier = (doc.tier or getattr(current, "plan_tier", None) or ("pro" if current.is_paid else "demo")).lower()
     caps = _caps_for_tier(tier)
@@ -454,28 +507,42 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
 
     excerpt = (doc.content or "")[:caps["max_extract_chars"]]
 
-    # run brains
+    # ---- run brains ----
     raw_brain_outputs: List[Dict[str, Any]] = []
     insights: List[Insight] = []
-    for brain_name in ("CFO", "CHRO", "COO", "CMO", "CPO"):
+    roles = ("CFO", "CHRO", "COO", "CMO", "CPO")
+
+    for brain_name in roles:
         fn = brain_registry.get(brain_name)
         if not fn:
             continue
-        out = fn({"document_excerpt": excerpt, "tier": tier})
+        out = fn({"document_excerpt": excerpt, "tier": tier}) or {}
         role = (out.get("role") or brain_name).upper()
-        topline = (out.get("topline_insight") or out.get("summary") or "").strip()
+
+        # If a brain ever returns an error string (defensive)
+        raw_text_error = ""
+        if isinstance(out, str) and out.startswith("[OPENROUTER"):
+            raw_text_error = out
+
+        topline = (out.get("topline_insight") or out.get("summary") or raw_text_error or "").strip()
         recs = list(out.get("recommendations") or [])
+
+        # Fallback per role if empty
+        if not recs:
+            recs = _fallback_recs(role, excerpt)
+
         raw_brain_outputs.append({"role": role, "topline_insight": topline, "recommendations": recs})
         insights.append(Insight(role=role, summary=topline, recommendations=recs))
 
-    # aggregate
+    # ---- aggregate ----
     agg = aggregate_brain_outputs(raw_brain_outputs, tier=tier) or {}
     collective = list(agg.get("collective") or agg.get("collective_insights") or [])
     recs_by_role = dict(agg.get("recommendations_by_role") or {})
 
-    # fallbacks if aggregator empty
+    # Fallbacks if the aggregator returns nothing
     if not collective:
         collective = [r["topline_insight"] for r in raw_brain_outputs if r.get("topline_insight")]
+
     if not recs_by_role:
         recs_by_role = {r["role"]: list(r.get("recommendations") or []) for r in raw_brain_outputs}
 
@@ -493,6 +560,24 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     _log_usage(db, current.id, "/api/analyze", meta=f"tier={tier}")
     job_id = str(uuid.uuid4())
     return {"job_id": job_id, "combined": combined_dict}
+
+# (Optional) Admin-only debug endpoint
+@api.post("/debug/brains")
+def debug_brains(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get_current_user)):
+    """Returns each brain's raw dict for quick troubleshooting (admin only)."""
+    if not getattr(current, "is_admin", False):
+        raise HTTPException(status_code=403, detail="Admins only")
+    excerpt = (doc.content or "")[:4000]
+    out = {}
+    for name in ("CFO","CHRO","COO","CMO","CPO"):
+        fn = brain_registry.get(name)
+        if not fn:
+            continue
+        try:
+            out[name] = fn({"document_excerpt": excerpt, "tier": "premium"})
+        except Exception as e:
+            out[name] = {"error": str(e)}
+    return out
 
 
 # ==============================================================================
@@ -551,6 +636,7 @@ async def chat_send(
     Accepts multipart (message + files), extracts text, calls analyze directly,
     and stores both user and assistant messages.
     Uses only primitive copies of ORM fields post-commit (avoids DetachedInstanceError).
+    Returns structured JSON for FE (with markdown fallback).
     """
     # 1) ensure/create session
     if session_id:
@@ -608,18 +694,32 @@ async def chat_send(
     tier_for_analysis = "premium" if getattr(current, "is_admin", False) else ("pro" if getattr(current, "is_paid", False) else "demo")
     try:
         doc = DocumentIn(content=combined_text, filename=(filenames[0] if filenames else None), tier=tier_for_analysis)
-        analysis = api_analyze(doc=doc, db=db, current=current)  # returns dict (AnalyzeResponse)
-        reply_md = _format_analyze_to_cxo_md(analysis if isinstance(analysis, dict) else analysis.model_dump())
-        reply = reply_md if reply_md.strip() else "No actionable data found."
-    except Exception as e:
-        reply = f"Received {len(filenames)} file(s). Could not run full analysis.\n\nError: {e}"
+        analysis = api_analyze(doc=doc, db=db, current=current)
+        analysis_dict = analysis if isinstance(analysis, dict) else analysis.model_dump()
 
-    # 5) assistant message
-    am = ChatMessage(session_id=sess_id, role="assistant", content=reply, created_at=datetime.utcnow())
+        # Build both: structured JSON (for FE) and markdown (fallback)
+        structured = _build_structured_from_analysis(analysis_dict)
+        reply_md = _format_analyze_to_cxo_md(analysis_dict)
+
+        if (structured.get("collective_insights") or any(structured["recommendations_by_role"].values())):
+            reply_content = json.dumps(structured, ensure_ascii=False)
+            reply_is_json = True
+        else:
+            reply_content = reply_md if reply_md.strip() else "No actionable data found."
+            reply_is_json = False
+
+    except Exception as e:
+        reply_content = f"Received {len(filenames)} file(s). Could not run full analysis.\n\nError: {e}"
+        reply_is_json = False
+
+    # 5) assistant message (store JSON-string or markdown)
+    am = ChatMessage(session_id=sess_id, role="assistant", content=reply_content, created_at=datetime.utcnow())
     db.add(am); db.commit(); db.refresh(am)
 
-    _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(filenames)}")
-    return {
+    _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(filenames)};json={reply_is_json}")
+
+    # Return both: string content and parsed object (if JSON)
+    resp_payload = {
         "session_id": sess_id,
         "assistant": {
             "id": int(am.id),
@@ -628,6 +728,10 @@ async def chat_send(
             "created_at": am.created_at.isoformat() + "Z",
         },
     }
+    if reply_is_json:
+        resp_payload["assistant"]["content_json"] = structured
+
+    return resp_payload
 
 
 # ==============================================================================
