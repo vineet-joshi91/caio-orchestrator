@@ -1,28 +1,22 @@
-# caio_core/settings.py
-try:
-    from pydantic_settings import BaseSettings, SettingsConfigDict
-except Exception:
-    from pydantic import BaseSettings  # fallback for older envs
-    SettingsConfigDict = dict  # type: ignore
 
-from pydantic import field_validator
-from typing import List, Optional
+from pydantic_settings import BaseSettings
+from typing import Optional
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")  # type: ignore
+    APP_NAME: str = "CAIO Orchestrator"
+    VERSION: str = "4.1.0-mvp"
+    CORS_ORIGINS: str = "*"  # comma-separated or '*'
+    JWT_SECRET: str = "CHANGE_ME"
+    JWT_EXPIRE_MINUTES: int = 120
 
-    # ... your existing fields ...
+    ENGINE_PROVIDER: str = "openai"  # openai|local
+    OPENAI_API_KEY: Optional[str] = None
+    OPENAI_MODEL: str = "gpt-4o-mini"
 
-    CORS_ORIGINS: List[str] = []
-    ALLOWED_ORIGINS: List[str] = []      # <— add this
+    # Storage (MVP can be local)
+    STORAGE_DIR: str = "storage"
 
-    @field_validator("CORS_ORIGINS", "ALLOWED_ORIGINS", mode="before")
-    @classmethod
-    def _split_csv(cls, v):
-        if not v:
-            return []
-        if isinstance(v, str):
-            return [s.strip() for s in v.split(",") if s.strip()]
-        return v
+    class Config:
+        env_file = ".env"
 
 settings = Settings()
