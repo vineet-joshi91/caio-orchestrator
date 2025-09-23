@@ -529,9 +529,10 @@ async def chat_send(
 ):
     """
     Accepts multipart (message + files), extracts text, calls /api/analyze internally,
-    and stores both user and assistant messages.
+    and stores both user and assistant messages. Avoids DetachedInstanceError by
+    capturing all needed primitives before/after commits.
     """
-    # 1) ensure/create session
+    # 1) ensure/create session (capture sess_id as a primitive)
     if session_id:
         sess = (
             db.query(ChatSession)
@@ -540,36 +541,58 @@ async def chat_send(
         )
         if not sess:
             raise HTTPException(status_code=404, detail="Session not found")
+        sess_id = int(sess.id)  # capture primitive
     else:
         sess = ChatSession(user_id=current.id, title=None, created_at=datetime.utcnow())
-        db.add(sess); db.commit(); db.refresh(sess)
+        db.add(sess)
+        db.commit()            # sess will expire on commit in default config
+        db.refresh(sess)       # re-bind and load
+        sess_id = int(sess.id) # capture primitive immediately
+        # IMPORTANT: do not read sess.* again after this point
 
-    # 2) persist user message
+    # 2) persist user message (again, capture returned ID/created_at into primitives)
     msg_text = (message or "").strip()
     filenames = [f.filename for f in (files or []) if getattr(f, "filename", None)]
+
     if not msg_text and not filenames:
         raise HTTPException(status_code=400, detail="Provide a message or at least one file.")
+
     user_content = msg_text or "(file only)"
     if filenames:
         user_content += f"\n\n[files: {', '.join(filenames)}]"
-    um = ChatMessage(session_id=sess.id, role="user", content=user_content, created_at=datetime.utcnow())
-    db.add(um); db.commit(); db.refresh(um)
 
-    # 3) analysis input
+    um = ChatMessage(session_id=sess_id, role="user", content=user_content, created_at=datetime.utcnow())
+    db.add(um)
+    db.commit()
+    db.refresh(um)
+    # capture primitives, then stop touching `um`
+    um_id = int(um.id)
+    um_created_iso = um.created_at.isoformat() + "Z"
+
+    # 3) analysis input: message + extracted file text
     appendix = await _extract_text_from_files(files)
     combined_text = (msg_text + "\n\n" + appendix).strip() if appendix else msg_text
 
     if not combined_text:
         # couldn't read any text from file(s)
-        am = ChatMessage(
-            session_id=sess.id,
+        fallback = ChatMessage(
+            session_id=sess_id,
             role="assistant",
             content="Got your file(s). Please add a brief question/context to start analysis.",
             created_at=datetime.utcnow(),
         )
-        db.add(am); db.commit(); db.refresh(am)
-        return {"session_id": sess.id,
-                "assistant": {"id": am.id, "role": am.role, "content": am.content, "created_at": am.created_at.isoformat()+"Z"}}
+        db.add(fallback)
+        db.commit()
+        db.refresh(fallback)
+        # capture primitives
+        a_id = int(fallback.id)
+        a_content = fallback.content
+        a_created = fallback.created_at.isoformat() + "Z"
+        _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(filenames)}")
+        return {
+            "session_id": sess_id,
+            "assistant": {"id": a_id, "role": "assistant", "content": a_content, "created_at": a_created},
+        }
 
     # 4) call our own /api/analyze (IMPORTANT: use 'content', not 'text')
     tier_for_analysis = "premium" if getattr(current, "is_admin", False) else ("pro" if getattr(current, "is_paid", False) else "demo")
@@ -586,13 +609,23 @@ async def chat_send(
     except Exception as e:
         reply = f"Received {len(filenames)} file(s). Could not run full analysis.\n\nError: {e}"
 
-    # 5) store assistant message & respond
-    am = ChatMessage(session_id=sess.id, role="assistant", content=reply, created_at=datetime.utcnow())
-    db.add(am); db.commit(); db.refresh(am)
+    # 5) store assistant message & respond (again: capture primitives)
+    am = ChatMessage(session_id=sess_id, role="assistant", content=reply, created_at=datetime.utcnow())
+    db.add(am)
+    db.commit()
+    db.refresh(am)
+    a_id = int(am.id)
+    a_content = am.content
+    a_created = am.created_at.isoformat() + "Z"
 
     _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(filenames)}")
-    return {"session_id": sess.id,
-            "assistant": {"id": am.id, "role": am.role, "content": am.content, "created_at": am.created_at.isoformat()+"Z"}}
+
+    # Return only primitives; do NOT access ORM instances below
+    return {
+        "session_id": sess_id,
+        "assistant": {"id": a_id, "role": "assistant", "content": a_content, "created_at": a_created},
+        # (Optional) If you later need um_id/um timestamp, you already captured `um_id`, `um_created_iso`
+    }
 
 # Mount /api
 app.include_router(api)
