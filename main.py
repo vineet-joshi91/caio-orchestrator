@@ -528,11 +528,10 @@ async def chat_send(
     current: User = Depends(get_current_user),
 ):
     """
-    Accepts multipart (message + files), extracts text, calls /api/analyze internally,
-    and stores both user and assistant messages. Avoids DetachedInstanceError by
-    capturing all needed primitives before/after commits.
+    Accepts multipart (message + files), extracts text, calls analyze directly
+    (no internal HTTP call), and stores both user and assistant messages.
     """
-    # 1) ensure/create session (capture sess_id as a primitive)
+    # 1) ensure/create session (capture primitives to avoid DetachedInstanceError)
     if session_id:
         sess = (
             db.query(ChatSession)
@@ -541,16 +540,15 @@ async def chat_send(
         )
         if not sess:
             raise HTTPException(status_code=404, detail="Session not found")
-        sess_id = int(sess.id)  # capture primitive
+        sess_id = int(sess.id)
     else:
         sess = ChatSession(user_id=current.id, title=None, created_at=datetime.utcnow())
         db.add(sess)
-        db.commit()            # sess will expire on commit in default config
-        db.refresh(sess)       # re-bind and load
-        sess_id = int(sess.id) # capture primitive immediately
-        # IMPORTANT: do not read sess.* again after this point
+        db.commit()
+        db.refresh(sess)
+        sess_id = int(sess.id)
 
-    # 2) persist user message (again, capture returned ID/created_at into primitives)
+    # 2) persist user message
     msg_text = (message or "").strip()
     filenames = [f.filename for f in (files or []) if getattr(f, "filename", None)]
 
@@ -565,66 +563,67 @@ async def chat_send(
     db.add(um)
     db.commit()
     db.refresh(um)
-    # capture primitives, then stop touching `um`
-    um_id = int(um.id)
-    um_created_iso = um.created_at.isoformat() + "Z"
+    # primitives captured if you need them later:
+    # um_id = int(um.id); um_created_iso = um.created_at.isoformat() + "Z"
 
-    # 3) analysis input: message + extracted file text
+    # 3) analysis input: message + extracted text from files
     appendix = await _extract_text_from_files(files)
     combined_text = (msg_text + "\n\n" + appendix).strip() if appendix else msg_text
 
     if not combined_text:
-        # couldn't read any text from file(s)
         fallback = ChatMessage(
             session_id=sess_id,
             role="assistant",
             content="Got your file(s). Please add a brief question/context to start analysis.",
             created_at=datetime.utcnow(),
         )
-        db.add(fallback)
-        db.commit()
-        db.refresh(fallback)
-        # capture primitives
-        a_id = int(fallback.id)
-        a_content = fallback.content
-        a_created = fallback.created_at.isoformat() + "Z"
-        _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(filenames)}")
+        db.add(fallback); db.commit(); db.refresh(fallback)
         return {
             "session_id": sess_id,
-            "assistant": {"id": a_id, "role": "assistant", "content": a_content, "created_at": a_created},
+            "assistant": {
+                "id": int(fallback.id),
+                "role": "assistant",
+                "content": fallback.content,
+                "created_at": fallback.created_at.isoformat() + "Z",
+            },
         }
 
-    # 4) call our own /api/analyze (IMPORTANT: use 'content', not 'text')
-    tier_for_analysis = "premium" if getattr(current, "is_admin", False) else ("pro" if getattr(current, "is_paid", False) else "demo")
-    payload = {"content": combined_text, "tier": tier_for_analysis, "filename": (filenames[0] if filenames else None)}
+    # 4) DIRECTLY call the analyze function (no HTTP, no auth header needed)
+    tier_for_analysis = (
+        "premium" if getattr(current, "is_admin", False)
+        else ("pro" if getattr(current, "is_paid", False) else "demo")
+    )
 
     try:
-        async with httpx.AsyncClient(app=app, base_url="http://internal") as client:
-            r = await client.post("/api/analyze", json=payload, timeout=120.0)
-        if not r.is_success:
-            raise RuntimeError(f"/api/analyze {r.status_code}: {r.text[:400]}")
-        analysis = r.json()
-        reply_md = _format_analyze_to_cxo_md(analysis)
+        # Build the same payload your /api/analyze route expects
+        doc = DocumentIn(
+            content=combined_text,
+            filename=(filenames[0] if filenames else None),
+            tier=tier_for_analysis,
+        )
+        analysis = api_analyze(doc=doc, db=db, current=current)  # ← direct call
+
+        reply_md = _format_analyze_to_cxo_md(
+            analysis if isinstance(analysis, dict) else analysis.model_dump()
+        )
         reply = reply_md if reply_md.strip() else "No recommendations were generated."
     except Exception as e:
         reply = f"Received {len(filenames)} file(s). Could not run full analysis.\n\nError: {e}"
 
-    # 5) store assistant message & respond (again: capture primitives)
+    # 5) store assistant message & respond
     am = ChatMessage(session_id=sess_id, role="assistant", content=reply, created_at=datetime.utcnow())
-    db.add(am)
-    db.commit()
-    db.refresh(am)
-    a_id = int(am.id)
-    a_content = am.content
-    a_created = am.created_at.isoformat() + "Z"
+    db.add(am); db.commit(); db.refresh(am)
 
     _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(filenames)}")
 
-    # Return only primitives; do NOT access ORM instances below
     return {
         "session_id": sess_id,
-        "assistant": {"id": a_id, "role": "assistant", "content": a_content, "created_at": a_created},
-        # (Optional) If you later need um_id/um timestamp, you already captured `um_id`, `um_created_iso`
+        "assistant": {
+            "id": int(am.id),
+            "role": am.role,
+            "content": am.content,
+            "created_at": am.created_at.isoformat() + "Z",
+        },
     }
 
 # Mount /api
