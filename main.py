@@ -1,30 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-CAIO Backend — unified hub wired to Neon (DB) + Auth + Analyze/Brains + Chat + Admin + Payments + Contact
-Matches the endpoints your frontend calls.
-
-Build (Render): pip install -r backend/requirements.txt
-Start (Render): uvicorn --app-dir backend main:app --host 0.0.0.0 --port $PORT
+CAIO Orchestrator Backend
+ - Auth, Profile, Public Config
+ - Analyze (brains + aggregator)
+ - Premium Chat (sessioned)
+ - Health/Ready
 """
 
 import os
-import asyncio
+import io
+import csv
 import uuid
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
-import io
 
 from fastapi import (
-    FastAPI, APIRouter, Depends, HTTPException, Header, Request, Query,
+    FastAPI, APIRouter, Depends, HTTPException, Request, Header, Query,
     UploadFile, File, Form
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse
 
-try:
-    import pandas as pd
-except Exception:
-    pd = None
+# Optional parsers (used if available; code is resilient if missing)
 try:
     from pypdf import PdfReader
 except Exception:
@@ -33,58 +31,52 @@ try:
     import docx  # python-docx
 except Exception:
     docx = None
-
-import httpx  # for internal app call
-
-# ---- core settings / schemas / utils (your files) ----
-from caio_core.settings import settings  # APP_NAME, VERSION, CORS_ORIGINS, JWT_EXPIRE_MINUTES
-from caio_core.schemas import (
-    DocumentIn, BrainRequest, CombinedInsights, Insight, AnalyzeResponse,
-    AuthSignup, AuthLogin, AuthToken, Me, Health
-)
-from caio_core.utils import sign_jwt, verify_jwt
-
-# ---- DB & auth layer (your files) ----
-from db import get_db, init_db, User, UsageLog, ChatSession, ChatMessage
-from auth import (
-    get_current_user,
-    create_access_token,
-    get_password_hash,
-    verify_password,
-)
-
-# ---- Feature routers (already exist in your repo) ----
 try:
-    from health import router as health_router         # /api/health, /api/ready
+    import openpyxl  # Excel without pandas
+except Exception:
+    openpyxl = None
+
+# --- Core settings/schemas/utils (your modules) ---
+from caio_core.settings import settings
+from caio_core.schemas import (
+    DocumentIn, AnalyzeResponse, Insight, CombinedInsights,
+    AuthLogin, AuthToken, Me, Health
+)
+from caio_core.aggregation.brain_aggregator import aggregate_brain_outputs
+
+# --- DB & auth (your modules) ---
+from db import get_db, init_db, User, UsageLog, ChatSession, ChatMessage
+from auth import get_current_user, create_access_token, get_password_hash, verify_password
+
+# --- Feature routers (optional) ---
+try:
+    from health import router as health_router
 except Exception:
     health_router = None
-
 try:
-    from admin import router as admin_router           # /api/admin/...
+    from admin import router as admin_router
 except Exception:
     admin_router = None
-
 try:
-    from admin_metrics import router as admin_metrics_router  # /api/admin/metrics
+    from admin_metrics import router as admin_metrics_router
 except Exception:
     admin_metrics_router = None
-
 try:
-    from payment import router as payments_router      # /api/payments/...
+    from payment import router as payments_router
 except Exception:
     payments_router = None
-
 try:
-    from contact import router as contact_router       # /api/contact
+    from contact import router as contact_router
 except Exception:
     contact_router = None
 
-# ---- Brains (registry + your engine adapter lives behind each brain) ----
+# --- Brains registry (your module) ---
 from brains.registry import brain_registry
 
-# ------------------------------------------------------------------------------
-# App + CORS
-# ------------------------------------------------------------------------------
+
+# ==============================================================================
+# App & CORS
+# ==============================================================================
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
 
 allowed = settings.ALLOWED_ORIGINS_LIST
@@ -103,12 +95,13 @@ app.add_middleware(
 def options_ok(path: str):
     return PlainTextResponse("ok")
 
-# ------------------------------------------------------------------------------
-# Startup: warm DB so /api/ready reflects state
-# ------------------------------------------------------------------------------
+
+# ==============================================================================
+# Startup warmup (DB)
+# ==============================================================================
 DB_READY = False
 STARTUP_OK = False
-STARTUP_ERROR = ""
+STARTUP_ERR = ""
 
 async def _warmup_db():
     global DB_READY
@@ -124,43 +117,19 @@ async def _warmup_db():
 
 @app.on_event("startup")
 async def _startup():
-    global STARTUP_OK, STARTUP_ERROR
+    global STARTUP_OK, STARTUP_ERR
     try:
         await _warmup_db()
         STARTUP_OK = True
-        STARTUP_ERROR = ""
+        STARTUP_ERR = ""
     except Exception as e:
         STARTUP_OK = False
-        STARTUP_ERROR = str(e)[:500]
+        STARTUP_ERR = str(e)[:400]
 
-# ------------------------------------------------------------------------------
-# Basic health/version
-# ------------------------------------------------------------------------------
-@app.get("/health", response_model=Health)
-def health():
-    return Health(status="ok", version=settings.VERSION)
 
-@app.get("/version")
-def version():
-    return {"version": settings.VERSION}
-
-# Fallback /api/ready if external router not mounted
-@app.get("/api/ready")
-def api_ready_fallback():
-    return {"ok": True, "db": DB_READY, "startup": STARTUP_OK}
-
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
-def bearer_email(authorization: Optional[str] = Header(None)) -> str:
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing token")
-    token = authorization.split(" ", 1)[1]
-    payload = verify_jwt(token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return payload["sub"]
-
+# ==============================================================================
+# Small helpers
+# ==============================================================================
 def _today_bounds_utc() -> Tuple[datetime, datetime]:
     now = datetime.utcnow()
     start = datetime(now.year, now.month, now.day)
@@ -180,7 +149,7 @@ def _caps_for_tier(tier: str) -> Dict[str, int]:
     def _iget(name, default):
         try:
             return int(os.getenv(name, str(default)))
-        except:
+        except Exception:
             return default
     if t == "demo":
         return {"analyze_per_day": _iget("MAX_CALLS_PER_DAY_DEMO", 3),
@@ -188,13 +157,13 @@ def _caps_for_tier(tier: str) -> Dict[str, int]:
                 "uploads_per_day": _iget("FREE_UPLOADS", 3),
                 "max_extract_chars": _iget("MAX_EXTRACT_CHARS_DEMO", 2000),
                 "max_file_mb": _iget("MAX_FILE_MB_DEMO", 2)}
-    if t in ("pro",):
+    if t == "pro":
         return {"analyze_per_day": _iget("PRO_QUERIES_PER_DAY", 50),
                 "chat_msgs_per_day": _iget("MAX_CALLS_PER_DAY_PRO", 200),
                 "uploads_per_day": _iget("UPLOADS_PER_DAY_PAID", 50),
                 "max_extract_chars": _iget("MAX_EXTRACT_CHARS_PRO", 12000),
                 "max_file_mb": _iget("MAX_FILE_MB_PRO", 15)}
-    if t in ("pro+", "pro_plus"):
+    if t in ("pro_plus", "pro+"):
         return {"analyze_per_day": _iget("PRO_QUERIES_PER_DAY", 50),
                 "chat_msgs_per_day": _iget("PRO_PLUS_MSGS_PER_DAY", 25),
                 "uploads_per_day": _iget("UPLOADS_PER_DAY_PAID", 50),
@@ -223,7 +192,7 @@ def _public_config_from_env() -> Dict[str, Any]:
             "USD": {"symbol": "$",
                     "pro": int(os.getenv("PRO_PRICE_USD", 25)),
                     "pro_plus": int(os.getenv("PRO_PLUS_PRICE_USD", 49)),
-                    "premium": int(os.getenv("PREMIUM_PRICE_USD", 99))}
+                    "premium": int(os.getenv("PREMIUM_PRICE_USD", 99))},
         }
     limits = {
         "demo":   {"analyze": int(os.getenv("MAX_CALLS_PER_DAY_DEMO", 3)),
@@ -247,124 +216,33 @@ def _public_config_from_env() -> Dict[str, Any]:
         "limits": limits,
     }
 
-def _safe_head(df, n=20):
-    try:
-        return df.head(n).to_markdown(index=False)
-    except Exception:
-        return df.head(n).to_string(index=False)
 
-async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
-    """
-    Best-effort text extraction. Works even if some libs are missing.
-    Limits per-file bytes/pages to keep request small.
-    """
-    if not files:
-        return ""
-    chunks: List[str] = []
-    for f in files:
-        name = (f.filename or "file").strip()
-        lower = name.lower()
-        try:
-            raw = await f.read()
-        except Exception:
-            continue
+# ==============================================================================
+# Health/Ready
+# ==============================================================================
+@app.get("/health", response_model=Health)
+def health():
+    return Health(status="ok", version=settings.VERSION)
 
-        if len(raw) > 3_000_000:
-            raw = raw[:3_000_000]
+@app.get("/version")
+def version():
+    return {"version": settings.VERSION}
 
-        if lower.endswith(".pdf") and PdfReader is not None:
-            try:
-                reader = PdfReader(io.BytesIO(raw))
-                pages = min(len(reader.pages), 10)
-                text = []
-                for i in range(pages):
-                    text.append(reader.pages[i].extract_text() or "")
-                chunks.append(f"\n\n# [PDF] {name}\n" + "\n".join(text))
-                continue
-            except Exception:
-                pass
+# Fallback ready (in case health router isn't mounted)
+@app.get("/api/ready")
+def api_ready():
+    return {"ok": True, "db": DB_READY, "startup": STARTUP_OK}
 
-        if lower.endswith(".docx") and docx is not None:
-            try:
-                d = docx.Document(io.BytesIO(raw))
-                text = "\n".join([p.text for p in d.paragraphs if p.text.strip()])[:15000]
-                chunks.append(f"\n\n# [DOCX] {name}\n{text}")
-                continue
-            except Exception:
-                pass
 
-        if lower.endswith(".csv") and pd is not None:
-            try:
-                df = pd.read_csv(io.BytesIO(raw))
-                preview = _safe_head(df)
-                try:
-                    desc = df.describe(include="all").to_markdown()
-                except Exception:
-                    desc = ""
-                chunks.append(f"\n\n# [CSV] {name}\n## preview\n{preview}\n\n## describe\n{desc}")
-                continue
-            except Exception:
-                pass
-
-        if (lower.endswith(".xlsx") or lower.endswith(".xls")) and pd is not None:
-            try:
-                excel = pd.ExcelFile(io.BytesIO(raw))
-                sheet_names = excel.sheet_names[:5]
-                parts = [f"Sheets: {', '.join(sheet_names)}"]
-                for s in sheet_names:
-                    df = excel.parse(s)
-                    preview = _safe_head(df)
-                    parts.append(f"\n### sheet: {s}\n{preview}")
-                chunks.append(f"\n\n# [XLSX] {name}\n" + "\n".join(parts))
-                continue
-            except Exception:
-                pass
-
-        try:
-            txt = raw.decode("utf-8", errors="ignore")[:20000]
-            chunks.append(f"\n\n# [TEXT] {name}\n{txt}")
-        except Exception:
-            pass
-
-    return "\n".join(chunks).strip()
-
-def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
-    """
-    Convert /api/analyze JSON into the CXO markdown your chat UI expects.
-    """
-    lines: List[str] = []
-
-    ci = resp.get("collective_insights") or resp.get("combined", {}).get("aggregate", {}).get("collective", []) or []
-    if ci:
-        lines.append("## Collective Insights")
-        for i, item in enumerate(ci[:10], 1):
-            lines.append(f"{i}. {item}")
-        lines.append("")
-
-    recs = resp.get("cxo_recommendations") or resp.get("combined", {}).get("aggregate", {}).get("recommendations_by_role", {})
-    for role in ["CFO", "CHRO", "COO", "CMO", "CPO"]:
-        rlist = recs.get(role) or []
-        lines.append(f"## {role}")
-        if rlist:
-            lines.append("### Recommendations")
-            for i, r in enumerate(rlist, 1):
-                lines.append(f"{i}. {r}")
-        else:
-            lines.append("_No recommendations._")
-        lines.append("")
-
-    return "\n".join(lines).strip()
-
-# ------------------------------------------------------------------------------
-# API router (prefix=/api)
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# Public Config + Auth/Profile
+# ==============================================================================
 api = APIRouter(prefix="/api", tags=["api"])
 
 @api.get("/public-config")
 def api_public_config():
     return _public_config_from_env()
 
-# ----- auth/profile -----
 @api.post("/signup")
 async def api_signup(request: Request, db=Depends(get_db)):
     email = password = None
@@ -375,7 +253,7 @@ async def api_signup(request: Request, db=Depends(get_db)):
             password = body.get("password")
     except Exception:
         pass
-    if (not email or not password) and request.headers.get("content-type","").lower().startswith("application/x-www-form-urlencoded"):
+    if (not email or not password) and request.headers.get("content-type", "").lower().startswith("application/x-www-form-urlencoded"):
         form = await request.form()
         email = (form.get("email") or "").strip().lower()
         password = form.get("password")
@@ -397,11 +275,14 @@ def api_login(body: AuthLogin, db=Depends(get_db)):
     user = db.query(User).filter(User.email == (body.email or "").lower()).first()
     if not user or not verify_password(body.password or "", user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    token = create_access_token(sub=user.email, expires_delta=timedelta(minutes=getattr(settings, "JWT_EXPIRE_MINUTES", 120)))
+    token = create_access_token(
+        sub=user.email, expires_delta=timedelta(minutes=getattr(settings, "JWT_EXPIRE_MINUTES", 120))
+    )
     return AuthToken(access_token=token)
 
 @api.get("/profile", response_model=Me)
 def api_profile(current: User = Depends(get_current_user)):
+    # treat admin as premium regardless of DB tier
     tier_val = (getattr(current, "plan_tier", None) or ("pro" if getattr(current, "is_paid", False) else "demo"))
     if getattr(current, "is_admin", False):
         tier_val = "premium"
@@ -412,7 +293,6 @@ def api_profile(current: User = Depends(get_current_user)):
         is_paid=bool(getattr(current, "is_paid", False)),
     )
 
-# Optional helper used by FE sometimes
 def _is_admin_email(email: str) -> bool:
     if not email:
         return False
@@ -429,11 +309,135 @@ def api_whoami(current: User = Depends(get_current_user)):
         tier = "premium"
     return {"email": current.email, "tier": tier, "is_admin": is_admin}
 
-# ----- analyze (multi-brain) -----
-from caio_core.aggregation.brain_aggregator import aggregate_brain_outputs
+
+# ==============================================================================
+# Brains + Analyze
+# ==============================================================================
+def _safe_head_rows(rows: List[List[Any]], n: int = 25) -> str:
+    out = []
+    for i, row in enumerate(rows):
+        if i >= n:
+            break
+        out.append(" | ".join((("" if v is None else str(v))[:80] for v in row)))
+    return "\n".join(out)
+
+async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
+    """
+    Best-effort text extraction (no pandas required).
+    Truncates generously to avoid token blowups.
+    """
+    if not files:
+        return ""
+    chunks: List[str] = []
+    for f in files:
+        name = (f.filename or "file").strip()
+        lower = name.lower()
+        try:
+            raw = await f.read()
+        except Exception:
+            continue
+
+        if len(raw) > 3_000_000:
+            raw = raw[:3_000_000]
+
+        # PDF
+        if lower.endswith(".pdf") and PdfReader is not None:
+            try:
+                reader = PdfReader(io.BytesIO(raw))
+                pages = min(len(reader.pages), 10)
+                text = []
+                for i in range(pages):
+                    text.append(reader.pages[i].extract_text() or "")
+                chunks.append(f"\n\n# [PDF] {name}\n" + "\n".join(text))
+                continue
+            except Exception:
+                pass
+
+        # DOCX
+        if lower.endswith(".docx") and docx is not None:
+            try:
+                d = docx.Document(io.BytesIO(raw))
+                text = "\n".join([p.text for p in d.paragraphs if p.text.strip()])[:15000]
+                chunks.append(f"\n\n# [DOCX] {name}\n{text}")
+                continue
+            except Exception:
+                pass
+
+        # CSV
+        if lower.endswith(".csv"):
+            try:
+                text = raw.decode("utf-8", errors="ignore")
+                rows = list(csv.reader(io.StringIO(text)))
+                chunks.append(f"\n\n# [CSV] {name}\n" + _safe_head_rows(rows, 25))
+                continue
+            except Exception:
+                pass
+
+        # XLSX/XLS
+        if (lower.endswith(".xlsx") or lower.endswith(".xls")) and openpyxl is not None:
+            try:
+                wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+                sheetnames = wb.sheetnames[:3]
+                parts = [f"Sheets: {', '.join(sheetnames)}"]
+                for s in sheetnames:
+                    ws = wb[s]
+                    lines = []
+                    for r_i, row in enumerate(ws.iter_rows(min_row=1, max_row=25, values_only=True)):
+                        if r_i >= 25:
+                            break
+                        lines.append(" | ".join((("" if v is None else str(v))[:80] for v in row)))
+                    parts.append(f"\n### sheet: {s}\n" + "\n".join(lines))
+                chunks.append(f"\n\n# [XLSX] {name}\n" + "\n".join(parts))
+                continue
+            except Exception:
+                pass
+
+        # TXT / fallback
+        try:
+            txt = raw.decode("utf-8", errors="ignore")[:20000]
+            chunks.append(f"\n\n# [TEXT] {name}\n{txt}")
+        except Exception:
+            pass
+
+    return "\n".join(chunks).strip()
+
+def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
+    """
+    Convert /api/analyze JSON into CXO markdown blocks the FE knows how to render.
+    """
+    lines: List[str] = []
+
+    # Flexible extraction from either top-level keys or combined.aggregate
+    combined = resp.get("combined") or {}
+    agg = combined.get("aggregate") or {}
+    collective = resp.get("collective_insights") or agg.get("collective") or agg.get("collective_insights") or []
+    recs_by_role = resp.get("cxo_recommendations") or agg.get("recommendations_by_role") or {}
+
+    if collective:
+        lines.append("## Collective Insights")
+        for i, item in enumerate(collective[:10], 1):
+            lines.append(f"{i}. {item}")
+        lines.append("")
+
+    for role in ["CFO", "CHRO", "COO", "CMO", "CPO"]:
+        rlist = list(recs_by_role.get(role) or [])
+        lines.append(f"## {role}")
+        if rlist:
+            lines.append("### Recommendations")
+            for i, r in enumerate(rlist, 1):
+                lines.append(f"{i}. {r}")
+        else:
+            lines.append("_No actionable data found._")
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 @api.post("/analyze", response_model=AnalyzeResponse)
 def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get_current_user)):
+    """
+    Run all brains on the provided content and aggregate.
+    Always return useful output, even if the aggregator returns nothing.
+    """
     tier = (doc.tier or getattr(current, "plan_tier", None) or ("pro" if current.is_paid else "demo")).lower()
     caps = _caps_for_tier(tier)
 
@@ -450,43 +454,59 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
 
     excerpt = (doc.content or "")[:caps["max_extract_chars"]]
 
-    raw_brain_outputs = []
+    # run brains
+    raw_brain_outputs: List[Dict[str, Any]] = []
     insights: List[Insight] = []
-    for brain_name in ("CFO","COO","CHRO","CMO","CPO"):
+    for brain_name in ("CFO", "CHRO", "COO", "CMO", "CPO"):
         fn = brain_registry.get(brain_name)
         if not fn:
             continue
         out = fn({"document_excerpt": excerpt, "tier": tier})
-        raw_brain_outputs.append(out)
-        insights.append(
-            Insight(
-                role=out["role"],
-                summary=out.get("summary",""),
-                recommendations=out.get("recommendations", []),
-            )
-        )
+        role = (out.get("role") or brain_name).upper()
+        topline = (out.get("topline_insight") or out.get("summary") or "").strip()
+        recs = list(out.get("recommendations") or [])
+        raw_brain_outputs.append({"role": role, "topline_insight": topline, "recommendations": recs})
+        insights.append(Insight(role=role, summary=topline, recommendations=recs))
 
-    agg = aggregate_brain_outputs(raw_brain_outputs, tier=tier)
+    # aggregate
+    agg = aggregate_brain_outputs(raw_brain_outputs, tier=tier) or {}
+    collective = list(agg.get("collective") or agg.get("collective_insights") or [])
+    recs_by_role = dict(agg.get("recommendations_by_role") or {})
+
+    # fallbacks if aggregator empty
+    if not collective:
+        collective = [r["topline_insight"] for r in raw_brain_outputs if r.get("topline_insight")]
+    if not recs_by_role:
+        recs_by_role = {r["role"]: list(r.get("recommendations") or []) for r in raw_brain_outputs}
+
     combined = CombinedInsights(
         document_filename=doc.filename,
-        overall_summary="Combined insights across CXO brains (MVP).",
+        overall_summary="Combined insights across CXO brains.",
         insights=insights,
     )
     combined_dict = combined.model_dump() if hasattr(combined, "model_dump") else combined.dict()
-    combined_dict["aggregate"] = agg
+    combined_dict["aggregate"] = {
+        "collective": collective,
+        "recommendations_by_role": recs_by_role,
+    }
 
     _log_usage(db, current.id, "/api/analyze", meta=f"tier={tier}")
     job_id = str(uuid.uuid4())
     return {"job_id": job_id, "combined": combined_dict}
 
-# ----- chat: sessions/history/send -----
+
+# ==============================================================================
+# Chat (sessions/history/send)
+# ==============================================================================
 @api.get("/chat/sessions")
 def chat_sessions_list(db=Depends(get_db), current: User = Depends(get_current_user)):
-    rows = (db.query(ChatSession)
-              .filter(ChatSession.user_id == current.id)
-              .order_by(ChatSession.created_at.desc())
-              .all())
-    return [{"id": r.id, "title": r.title or f"Session {r.id}", "created_at": r.created_at.isoformat()+"Z"} for r in rows]
+    rows = (
+        db.query(ChatSession)
+        .filter(ChatSession.user_id == current.id)
+        .order_by(ChatSession.created_at.desc())
+        .all()
+    )
+    return [{"id": r.id, "title": r.title or f"Session {r.id}", "created_at": r.created_at.isoformat() + "Z"} for r in rows]
 
 @api.post("/chat/sessions")
 def chat_sessions_create(body: Dict[str, Any] = None, db=Depends(get_db), current: User = Depends(get_current_user)):
@@ -495,15 +515,15 @@ def chat_sessions_create(body: Dict[str, Any] = None, db=Depends(get_db), curren
         title = (body.get("title") or "").strip() or None
     s = ChatSession(user_id=current.id, title=title, created_at=datetime.utcnow())
     db.add(s); db.commit(); db.refresh(s)
-    return {"id": s.id, "title": s.title or f"Session {s.id}", "created_at": s.created_at.isoformat()+"Z"}
+    return {"id": s.id, "title": s.title or f"Session {s.id}", "created_at": s.created_at.isoformat() + "Z"}
 
 @api.get("/chat/history")
 def chat_history_get(session_id: int = Query(..., ge=1), db=Depends(get_db), current: User = Depends(get_current_user)):
     sess = db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == current.id).first()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
-    msgs = (db.query(ChatMessage).filter(ChatMessage.session_id == sess.id).order_by(ChatMessage.created_at.asc()).all())
-    return [{"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat()+"Z"} for m in msgs]
+    msgs = db.query(ChatMessage).filter(ChatMessage.session_id == sess.id).order_by(ChatMessage.created_at.asc()).all()
+    return [{"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat() + "Z"} for m in msgs]
 
 @api.post("/chat/history")
 def chat_history_append(body: Dict[str, Any], db=Depends(get_db), current: User = Depends(get_current_user)):
@@ -517,7 +537,7 @@ def chat_history_append(body: Dict[str, Any], db=Depends(get_db), current: User 
         raise HTTPException(status_code=404, detail="Session not found")
     m = ChatMessage(session_id=sess.id, role=role, content=content, created_at=datetime.utcnow())
     db.add(m); db.commit(); db.refresh(m)
-    return {"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat()+"Z"}
+    return {"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat() + "Z"}
 
 @api.post("/chat/send")
 async def chat_send(
@@ -528,10 +548,11 @@ async def chat_send(
     current: User = Depends(get_current_user),
 ):
     """
-    Accepts multipart (message + files), extracts text, calls analyze directly
-    (no internal HTTP call), and stores both user and assistant messages.
+    Accepts multipart (message + files), extracts text, calls analyze directly,
+    and stores both user and assistant messages.
+    Uses only primitive copies of ORM fields post-commit (avoids DetachedInstanceError).
     """
-    # 1) ensure/create session (capture primitives to avoid DetachedInstanceError)
+    # 1) ensure/create session
     if session_id:
         sess = (
             db.query(ChatSession)
@@ -543,9 +564,7 @@ async def chat_send(
         sess_id = int(sess.id)
     else:
         sess = ChatSession(user_id=current.id, title=None, created_at=datetime.utcnow())
-        db.add(sess)
-        db.commit()
-        db.refresh(sess)
+        db.add(sess); db.commit(); db.refresh(sess)
         sess_id = int(sess.id)
 
     # 2) persist user message
@@ -560,13 +579,9 @@ async def chat_send(
         user_content += f"\n\n[files: {', '.join(filenames)}]"
 
     um = ChatMessage(session_id=sess_id, role="user", content=user_content, created_at=datetime.utcnow())
-    db.add(um)
-    db.commit()
-    db.refresh(um)
-    # primitives captured if you need them later:
-    # um_id = int(um.id); um_created_iso = um.created_at.isoformat() + "Z"
+    db.add(um); db.commit(); db.refresh(um)
 
-    # 3) analysis input: message + extracted text from files
+    # 3) analysis input
     appendix = await _extract_text_from_files(files)
     combined_text = (msg_text + "\n\n" + appendix).strip() if appendix else msg_text
 
@@ -578,6 +593,7 @@ async def chat_send(
             created_at=datetime.utcnow(),
         )
         db.add(fallback); db.commit(); db.refresh(fallback)
+        _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(filenames)}")
         return {
             "session_id": sess_id,
             "assistant": {
@@ -588,34 +604,21 @@ async def chat_send(
             },
         }
 
-    # 4) DIRECTLY call the analyze function (no HTTP, no auth header needed)
-    tier_for_analysis = (
-        "premium" if getattr(current, "is_admin", False)
-        else ("pro" if getattr(current, "is_paid", False) else "demo")
-    )
-
+    # 4) DIRECT analyze call (no internal HTTP)
+    tier_for_analysis = "premium" if getattr(current, "is_admin", False) else ("pro" if getattr(current, "is_paid", False) else "demo")
     try:
-        # Build the same payload your /api/analyze route expects
-        doc = DocumentIn(
-            content=combined_text,
-            filename=(filenames[0] if filenames else None),
-            tier=tier_for_analysis,
-        )
-        analysis = api_analyze(doc=doc, db=db, current=current)  # ← direct call
-
-        reply_md = _format_analyze_to_cxo_md(
-            analysis if isinstance(analysis, dict) else analysis.model_dump()
-        )
-        reply = reply_md if reply_md.strip() else "No recommendations were generated."
+        doc = DocumentIn(content=combined_text, filename=(filenames[0] if filenames else None), tier=tier_for_analysis)
+        analysis = api_analyze(doc=doc, db=db, current=current)  # returns dict (AnalyzeResponse)
+        reply_md = _format_analyze_to_cxo_md(analysis if isinstance(analysis, dict) else analysis.model_dump())
+        reply = reply_md if reply_md.strip() else "No actionable data found."
     except Exception as e:
         reply = f"Received {len(filenames)} file(s). Could not run full analysis.\n\nError: {e}"
 
-    # 5) store assistant message & respond
+    # 5) assistant message
     am = ChatMessage(session_id=sess_id, role="assistant", content=reply, created_at=datetime.utcnow())
     db.add(am); db.commit(); db.refresh(am)
 
     _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(filenames)}")
-
     return {
         "session_id": sess_id,
         "assistant": {
@@ -626,10 +629,11 @@ async def chat_send(
         },
     }
 
-# Mount /api
-app.include_router(api)
 
-# Mount existing routers (health/admin/admin_metrics/payments/contact)
+# ==============================================================================
+# Mount routers
+# ==============================================================================
+app.include_router(api)
 if health_router:         app.include_router(health_router)
 if admin_router:          app.include_router(admin_router)
 if admin_metrics_router:  app.include_router(admin_metrics_router)
