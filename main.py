@@ -398,29 +398,64 @@ async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
     return "\n".join(chunks).strip()
 
 def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
-    """Turn analyze JSON into CXO markdown blocks (chat-friendly)."""
-    lines: List[str] = []
+    """
+    Turn analyze JSON into the exact markdown the FE expects:
+      ## CFO
+      ### Insights
+      - ...
+      ### Recommendations
+      - ...
+    The FE flattens all per-role "Insights" bullets into the top Insights box.
+    """
     combined = resp.get("combined") or {}
     agg = combined.get("aggregate") or {}
     collective = resp.get("collective_insights") or agg.get("collective") or agg.get("collective_insights") or []
     recs_by_role = resp.get("cxo_recommendations") or agg.get("recommendations_by_role") or {}
 
-    if collective:
-        lines.append("## Collective Insights")
-        for i, item in enumerate(collective[:10], 1):
-            lines.append(f"{i}. {item}")
-        lines.append("")
+    # Build role -> insights from CombinedInsights.insights[]
+    role_insights: Dict[str, List[str]] = {r: [] for r in ["CFO", "CHRO", "COO", "CMO", "CPO"]}
+    try:
+        for it in (combined.get("insights") or []):
+            r = (it.get("role") or "").upper()
+            if r in role_insights:
+                s = (it.get("summary") or "").strip()
+                if s:
+                    role_insights[r].append(s)
+    except Exception:
+        pass
 
+    # Fallback: if a role has no insights, seed from collective (first 2)
+    for r in role_insights:
+        if not role_insights[r] and collective:
+            role_insights[r] = list(collective[:2])
+
+    # Fallback for recs: ensure dict keys exist
+    for r in ["CFO", "CHRO", "COO", "CMO", "CPO"]:
+        recs_by_role.setdefault(r, [])
+
+    # Compose markdown exactly as the FE parser expects
+    lines: List[str] = []
     for role in ["CFO", "CHRO", "COO", "CMO", "CPO"]:
-        rlist = list(recs_by_role.get(role) or [])
         lines.append(f"## {role}")
-        if rlist:
-            lines.append("### Recommendations")
-            for i, r in enumerate(rlist[:6], 1):
-                lines.append(f"{i}. {r}")
+        # Insights block (the FE aggregates these across roles to the top box)
+        lines.append("### Insights")
+        ins = [x for x in role_insights.get(role, []) if x]
+        if ins:
+            for i, item in enumerate(ins[:6], 1):
+                lines.append(f"{i}. {item}")
         else:
-            lines.append("_No actionable data found._")
-        lines.append("")
+            lines.append("- No material evidence in the provided context.")
+        lines.append("")  # spacing
+
+        # Recommendations block
+        lines.append("### Recommendations")
+        recs = [x for x in (recs_by_role.get(role) or []) if x]
+        if recs:
+            for i, item in enumerate(recs[:6], 1):
+                lines.append(f"{i}. {item}")
+        else:
+            lines.append("- No actionable data found.")
+        lines.append("")  # spacing between roles
 
     return "\n".join(lines).strip()
 
