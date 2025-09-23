@@ -278,6 +278,39 @@ def api_profile(current: User = Depends(get_current_user)):
         is_paid=current.is_paid,
     )
 
+# --- add under the "auth/profile" section in main.py ---
+
+def _is_admin_email(email: str) -> bool:
+    """
+    Accept both single ADMIN_EMAIL and comma-separated ADMIN_EMAILS.
+    True if DB flag is_admin or email is in allowlist.
+    """
+    if not email:
+        return False
+    email = email.strip().lower()
+    admin_one = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
+    admin_many = [e.strip().lower() for e in (os.getenv("ADMIN_EMAILS") or "").split(",") if e.strip()]
+    return (email == admin_one) or (email in admin_many)
+
+@api.get("/whoami")
+def api_whoami(current: User = Depends(get_current_user)):
+    """
+    Returns who the caller is, with an admin flag that also honors env allowlist.
+    Frontend will use this to redirect admins to Premium Chat.
+    """
+    tier = (getattr(current, "plan_tier", None) or ("pro" if current.is_paid else "demo")).lower()
+    is_admin = bool(getattr(current, "is_admin", False) or _is_admin_email(current.email))
+
+    # Optional: represent admins as 'premium' on the UI, but expose is_admin=true
+    if is_admin:
+        tier = "premium"
+
+    return {
+        "email": current.email,
+        "tier": tier,
+        "is_admin": is_admin
+    }
+
 # ----- analyze (multi-brain) -----
 
 @api.post("/analyze", response_model=AnalyzeResponse)  # If your schema lacks 'aggregate', extend it or drop response_model for now.
