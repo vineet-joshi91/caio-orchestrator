@@ -271,11 +271,16 @@ def api_login(body: AuthLogin, db=Depends(get_db)):
 
 @api.get("/profile", response_model=Me)
 def api_profile(current: User = Depends(get_current_user)):
+    # compute tier from DB, then upgrade to "premium" for admins
+    tier_val = (getattr(current, "plan_tier", None) or ("pro" if current.is_paid else "demo"))
+    if getattr(current, "is_admin", False):
+        tier_val = "premium"
+
     return Me(
         email=current.email,
-        tier=(getattr(current, "plan_tier", None) or ("pro" if current.is_paid else "demo")),
-        is_admin=current.is_admin,
-        is_paid=current.is_paid,
+        tier=tier_val,
+        is_admin=bool(getattr(current, "is_admin", False)),
+        is_paid=bool(getattr(current, "is_paid", False)),
     )
 
 # --- add under the "auth/profile" section in main.py ---
@@ -411,34 +416,86 @@ def chat_history_append(body: Dict[str, Any], db=Depends(get_db), current: User 
     db.add(m); db.commit(); db.refresh(m)
     return {"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat()+"Z"}
 
+from fastapi import UploadFile, File, Form
+
 @api.post("/chat/send")
-def chat_send(body: Dict[str, Any], db=Depends(get_db), current: User = Depends(get_current_user)):
+async def chat_send(
+    session_id: Optional[int] = Form(None),
+    message: Optional[str] = Form(None),
+    files: Optional[List[UploadFile]] = File(None),
+    db=Depends(get_db),
+    current: User = Depends(get_current_user),
+):
     """
-    Body: { session_id, message }
-    MVP behavior:
-      - append user message
-      - reply with a short assistant stub (or wire to a brain if you want)
+    Accepts multipart form:
+      - session_id: optional (if missing, create new session)
+      - message: optional (file-only allowed)
+      - files: optional, one or more files
+    Behavior:
+      - ensure session exists (create if needed)
+      - store a user message (with filenames note if any)
+      - return an assistant stub (replace with real LLM later)
     """
-    session_id = int(body.get("session_id") or 0)
-    message = (body.get("message") or "").strip()
-    if not session_id or not message:
-        raise HTTPException(status_code=400, detail="session_id and message are required")
+    # 1) ensure or create a session for this user
+    sess = None
+    if session_id:
+        sess = (
+            db.query(ChatSession)
+            .filter(ChatSession.id == int(session_id), ChatSession.user_id == current.id)
+            .first()
+        )
+        if not sess:
+            raise HTTPException(status_code=404, detail="Session not found")
+    else:
+        sess = ChatSession(user_id=current.id, title=None, created_at=datetime.utcnow())
+        db.add(sess); db.commit(); db.refresh(sess)
 
-    sess = db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == current.id).first()
-    if not sess:
-        raise HTTPException(status_code=404, detail="Session not found")
+    # 2) normalize user content
+    msg_text = (message or "").strip()
+    file_names = []
+    if files:
+        for f in files:
+            try:
+                file_names.append(f.filename)
+                # If you want: read/save bytes, push to storage, etc.
+                # _ = await f.read()
+            except Exception:
+                pass
 
-    # user msg
-    um = ChatMessage(session_id=sess.id, role="user", content=message, created_at=datetime.utcnow())
-    db.add(um); db.commit()
+    if not msg_text and not file_names:
+        raise HTTPException(status_code=400, detail="Provide a message or at least one file.")
 
-    # assistant stub (you can route to an LLM here, or call one 'brain')
-    reply = "Thanks! CAIO is processing this. (MVP stub)"
+    user_content = msg_text or "(file only)"
+    if file_names:
+        user_content += f"\n\n[files: {', '.join(file_names)}]"
+
+    # 3) persist user message
+    um = ChatMessage(session_id=sess.id, role="user", content=user_content, created_at=datetime.utcnow())
+    db.add(um); db.commit(); db.refresh(um)
+
+    # 4) assistant stub (swap with your brain/LLM pipeline as needed)
+    reply = "Received."
+    if file_names and not msg_text:
+        reply = f"Got {len(file_names)} file(s): {', '.join(file_names)}. Analyzing…"
+    elif file_names:
+        reply = f"Understood your request; also got {len(file_names)} file(s). Analyzing…"
+    elif msg_text:
+        reply = "On it. Analyzing…"
+
     am = ChatMessage(session_id=sess.id, role="assistant", content=reply, created_at=datetime.utcnow())
     db.add(am); db.commit(); db.refresh(am)
 
-    _log_usage(db, current.id, "/api/chat/send", meta="stub")
-    return {"reply": {"id": am.id, "role": am.role, "content": am.content, "created_at": am.created_at.isoformat()+"Z"}}
+    _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(file_names)}")
+
+    return {
+        "session_id": sess.id,
+        "assistant": {
+            "id": am.id,
+            "role": am.role,
+            "content": am.content,
+            "created_at": am.created_at.isoformat() + "Z",
+        },
+    }
 
 # Mount /api
 app.include_router(api)
