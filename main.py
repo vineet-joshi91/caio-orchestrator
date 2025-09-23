@@ -69,18 +69,11 @@ from brains.registry import brain_registry
 # ------------------------------------------------------------------------------
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
 
-origins: List[str] = []
-if getattr(settings, "CORS_ORIGINS", None):
-    origins += [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
-extra = (os.getenv("ALLOWED_ORIGINS") or "").strip()
-if extra:
-    origins += [o.strip() for o in extra.split(",") if o.strip()]
-if not origins:
-    origins = ["*"]
+allowed = (getattr(settings, "CORS_ORIGINS", []) or []) + (getattr(settings, "ALLOWED_ORIGINS", []) or [])
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=allowed,
     allow_credentials=True,
     allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
     allow_headers=["*"],
