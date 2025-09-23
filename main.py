@@ -10,14 +10,16 @@ Start (Render): uvicorn --app-dir backend main:app --host 0.0.0.0 --port $PORT
 import os
 import asyncio
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 import io
 
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Request, Query, UploadFile, File, Form, HTTPException, Depends
+from fastapi import (
+    FastAPI, APIRouter, Depends, HTTPException, Header, Request, Query,
+    UploadFile, File, Form
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
-from caio_core.aggregation.brain_aggregator import aggregate_brain_outputs
+from fastapi.responses import PlainTextResponse, JSONResponse
 
 try:
     import pandas as pd
@@ -32,7 +34,7 @@ try:
 except Exception:
     docx = None
 
-import httpx  # used to call our own FastAPI app internally
+import httpx  # for internal app call
 
 # ---- core settings / schemas / utils (your files) ----
 from caio_core.settings import settings  # APP_NAME, VERSION, CORS_ORIGINS, JWT_EXPIRE_MINUTES
@@ -63,7 +65,7 @@ except Exception:
     admin_router = None
 
 try:
-    from admin_metrics import router as admin_metrics_router  # /api/admin/metrics (timeseries)
+    from admin_metrics import router as admin_metrics_router  # /api/admin/metrics
 except Exception:
     admin_metrics_router = None
 
@@ -85,8 +87,7 @@ from brains.registry import brain_registry
 # ------------------------------------------------------------------------------
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
 
-allowed = settings.ALLOWED_ORIGINS_LIST  # safe list
-# if you want a permissive fallback in DEBUG:
+allowed = settings.ALLOWED_ORIGINS_LIST
 if not allowed and getattr(settings, "DEBUG", False):
     allowed = ["*"]
 
@@ -96,7 +97,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
-)   
+)
+
 @app.options("/{path:path}")
 def options_ok(path: str):
     return PlainTextResponse("ok")
@@ -132,7 +134,7 @@ async def _startup():
         STARTUP_ERROR = str(e)[:500]
 
 # ------------------------------------------------------------------------------
-# Basic health/version (flat)
+# Basic health/version
 # ------------------------------------------------------------------------------
 @app.get("/health", response_model=Health)
 def health():
@@ -142,8 +144,13 @@ def health():
 def version():
     return {"version": settings.VERSION}
 
+# Fallback /api/ready if external router not mounted
+@app.get("/api/ready")
+def api_ready_fallback():
+    return {"ok": True, "db": DB_READY, "startup": STARTUP_OK}
+
 # ------------------------------------------------------------------------------
-# Helpers: bearer decode, caps, usage log, time helpers
+# Helpers
 # ------------------------------------------------------------------------------
 def bearer_email(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -171,8 +178,10 @@ def _log_usage(db, user_id: int, endpoint: str, status_text="ok", meta: str = ""
 def _caps_for_tier(tier: str) -> Dict[str, int]:
     t = (tier or "demo").lower()
     def _iget(name, default):
-        try: return int(os.getenv(name, str(default)))
-        except: return default
+        try:
+            return int(os.getenv(name, str(default)))
+        except:
+            return default
     if t == "demo":
         return {"analyze_per_day": _iget("MAX_CALLS_PER_DAY_DEMO", 3),
                 "chat_msgs_per_day": _iget("MAX_CALLS_PER_DAY_DEMO", 3),
@@ -260,11 +269,9 @@ async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
         except Exception:
             continue
 
-        # cap size (~3MB) to avoid memory/token blowups
         if len(raw) > 3_000_000:
             raw = raw[:3_000_000]
 
-        # PDF
         if lower.endswith(".pdf") and PdfReader is not None:
             try:
                 reader = PdfReader(io.BytesIO(raw))
@@ -277,7 +284,6 @@ async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
             except Exception:
                 pass
 
-        # DOCX
         if lower.endswith(".docx") and docx is not None:
             try:
                 d = docx.Document(io.BytesIO(raw))
@@ -287,7 +293,6 @@ async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
             except Exception:
                 pass
 
-        # CSV
         if lower.endswith(".csv") and pd is not None:
             try:
                 df = pd.read_csv(io.BytesIO(raw))
@@ -301,7 +306,6 @@ async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
             except Exception:
                 pass
 
-        # XLS/XLSX
         if (lower.endswith(".xlsx") or lower.endswith(".xls")) and pd is not None:
             try:
                 excel = pd.ExcelFile(io.BytesIO(raw))
@@ -316,7 +320,6 @@ async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
             except Exception:
                 pass
 
-        # TXT / fallback
         try:
             txt = raw.decode("utf-8", errors="ignore")[:20000]
             chunks.append(f"\n\n# [TEXT] {name}\n{txt}")
@@ -328,19 +331,17 @@ async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
 def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
     """
     Convert /api/analyze JSON into the CXO markdown your chat UI expects.
-    - Collective Insights (top)
-    - Then ## CFO/CHRO/COO/CMO/CPO with ### Recommendations bullets
     """
     lines: List[str] = []
 
-    ci = resp.get("collective_insights") or []
+    ci = resp.get("collective_insights") or resp.get("combined", {}).get("aggregate", {}).get("collective", []) or []
     if ci:
         lines.append("## Collective Insights")
         for i, item in enumerate(ci[:10], 1):
             lines.append(f"{i}. {item}")
         lines.append("")
 
-    recs = (resp.get("cxo_recommendations") or {})
+    recs = resp.get("cxo_recommendations") or resp.get("combined", {}).get("aggregate", {}).get("recommendations_by_role", {})
     for role in ["CFO", "CHRO", "COO", "CMO", "CPO"]:
         rlist = recs.get(role) or []
         lines.append(f"## {role}")
@@ -355,11 +356,10 @@ def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 # ------------------------------------------------------------------------------
-# API router (prefix=/api) — matches your FE
+# API router (prefix=/api)
 # ------------------------------------------------------------------------------
 api = APIRouter(prefix="/api", tags=["api"])
 
-# ----- public config (pricing/limits for website) -----
 @api.get("/public-config")
 def api_public_config():
     return _public_config_from_env()
@@ -367,7 +367,6 @@ def api_public_config():
 # ----- auth/profile -----
 @api.post("/signup")
 async def api_signup(request: Request, db=Depends(get_db)):
-    # Accept JSON or form
     email = password = None
     try:
         body = await request.json()
@@ -406,7 +405,6 @@ def api_profile(current: User = Depends(get_current_user)):
     tier_val = (getattr(current, "plan_tier", None) or ("pro" if getattr(current, "is_paid", False) else "demo"))
     if getattr(current, "is_admin", False):
         tier_val = "premium"
-
     return Me(
         email=current.email,
         tier=tier_val,
@@ -414,13 +412,8 @@ def api_profile(current: User = Depends(get_current_user)):
         is_paid=bool(getattr(current, "is_paid", False)),
     )
 
-# --- add under the "auth/profile" section in main.py ---
-
+# Optional helper used by FE sometimes
 def _is_admin_email(email: str) -> bool:
-    """
-    Accept both single ADMIN_EMAIL and comma-separated ADMIN_EMAILS.
-    True if DB flag is_admin or email is in allowlist.
-    """
     if not email:
         return False
     email = email.strip().lower()
@@ -430,26 +423,16 @@ def _is_admin_email(email: str) -> bool:
 
 @api.get("/whoami")
 def api_whoami(current: User = Depends(get_current_user)):
-    """
-    Returns who the caller is, with an admin flag that also honors env allowlist.
-    Frontend will use this to redirect admins to Premium Chat.
-    """
     tier = (getattr(current, "plan_tier", None) or ("pro" if current.is_paid else "demo")).lower()
     is_admin = bool(getattr(current, "is_admin", False) or _is_admin_email(current.email))
-
-    # Optional: represent admins as 'premium' on the UI, but expose is_admin=true
     if is_admin:
         tier = "premium"
-
-    return {
-        "email": current.email,
-        "tier": tier,
-        "is_admin": is_admin
-    }
+    return {"email": current.email, "tier": tier, "is_admin": is_admin}
 
 # ----- analyze (multi-brain) -----
+from caio_core.aggregation.brain_aggregator import aggregate_brain_outputs
 
-@api.post("/analyze", response_model=AnalyzeResponse)  # If your schema lacks 'aggregate', extend it or drop response_model for now.
+@api.post("/analyze", response_model=AnalyzeResponse)
 def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get_current_user)):
     tier = (doc.tier or getattr(current, "plan_tier", None) or ("pro" if current.is_paid else "demo")).lower()
     caps = _caps_for_tier(tier)
@@ -465,10 +448,8 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     if used >= caps["analyze_per_day"]:
         raise HTTPException(status_code=429, detail=f"Daily analyze cap reached for tier '{tier}'")
 
-    # trim content by tier
     excerpt = (doc.content or "")[:caps["max_extract_chars"]]
 
-    # run brains
     raw_brain_outputs = []
     insights: List[Insight] = []
     for brain_name in ("CFO","COO","CHRO","CMO","CPO"):
@@ -485,29 +466,20 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
             )
         )
 
-    # aggregate (compact, UI-ready)
     agg = aggregate_brain_outputs(raw_brain_outputs, tier=tier)
-
-    # keep your original CombinedInsights shape for backward-compat
     combined = CombinedInsights(
         document_filename=doc.filename,
         overall_summary="Combined insights across CXO brains (MVP).",
         insights=insights,
     )
-
-    # if your Pydantic model doesn't include 'aggregate', either:
-    #  1) extend CombinedInsights/AnalyzeResponse to have an optional 'aggregate: dict | None', OR
-    #  2) return a plain dict and remove response_model from the decorator.
     combined_dict = combined.model_dump() if hasattr(combined, "model_dump") else combined.dict()
     combined_dict["aggregate"] = agg
 
     _log_usage(db, current.id, "/api/analyze", meta=f"tier={tier}")
     job_id = str(uuid.uuid4())
-
-    # return in the same outer shape, but with 'aggregate' included under 'combined'
     return {"job_id": job_id, "combined": combined_dict}
 
-# ----- chat: sessions/history/send (FE premium chat uses these) -----
+# ----- chat: sessions/history/send -----
 @api.get("/chat/sessions")
 def chat_sessions_list(db=Depends(get_db), current: User = Depends(get_current_user)):
     rows = (db.query(ChatSession)
@@ -547,8 +519,6 @@ def chat_history_append(body: Dict[str, Any], db=Depends(get_db), current: User 
     db.add(m); db.commit(); db.refresh(m)
     return {"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat()+"Z"}
 
-from fastapi import UploadFile, File, Form
-
 @api.post("/chat/send")
 async def chat_send(
     session_id: Optional[int] = Form(None),
@@ -558,11 +528,8 @@ async def chat_send(
     current: User = Depends(get_current_user),
 ):
     """
-    - Accepts multipart (message + files)
-    - Ensures/creates a chat session
-    - Extracts useful text from files
-    - Calls our own /api/analyze internally for CXO output
-    - Returns assistant message containing CXO-formatted markdown
+    Accepts multipart (message + files), extracts text, calls /api/analyze internally,
+    and stores both user and assistant messages.
     """
     # 1) ensure/create session
     if session_id:
@@ -575,32 +542,25 @@ async def chat_send(
             raise HTTPException(status_code=404, detail="Session not found")
     else:
         sess = ChatSession(user_id=current.id, title=None, created_at=datetime.utcnow())
-        db.add(sess)
-        db.commit()
-        db.refresh(sess)
+        db.add(sess); db.commit(); db.refresh(sess)
 
-    # 2) persist user message (with filenames note if any)
+    # 2) persist user message
     msg_text = (message or "").strip()
     filenames = [f.filename for f in (files or []) if getattr(f, "filename", None)]
-
     if not msg_text and not filenames:
         raise HTTPException(status_code=400, detail="Provide a message or at least one file.")
-
     user_content = msg_text or "(file only)"
     if filenames:
         user_content += f"\n\n[files: {', '.join(filenames)}]"
-
     um = ChatMessage(session_id=sess.id, role="user", content=user_content, created_at=datetime.utcnow())
-    db.add(um)
-    db.commit()
-    db.refresh(um)
+    db.add(um); db.commit(); db.refresh(um)
 
-    # 3) build analysis input: message + extracted file text
+    # 3) analysis input
     appendix = await _extract_text_from_files(files)
     combined_text = (msg_text + "\n\n" + appendix).strip() if appendix else msg_text
 
-    # If truly nothing to analyze (e.g., only a binary we couldn't read), acknowledge
     if not combined_text:
+        # couldn't read any text from file(s)
         am = ChatMessage(
             session_id=sess.id,
             role="assistant",
@@ -608,32 +568,22 @@ async def chat_send(
             created_at=datetime.utcnow(),
         )
         db.add(am); db.commit(); db.refresh(am)
-        return {
-            "session_id": sess.id,
-            "assistant": {
-                "id": am.id,
-                "role": am.role,
-                "content": am.content,
-                "created_at": am.created_at.isoformat() + "Z",
-            },
-        }
+        return {"session_id": sess.id,
+                "assistant": {"id": am.id, "role": am.role, "content": am.content, "created_at": am.created_at.isoformat()+"Z"}}
 
-    # 4) call our own /api/analyze internally (no external HTTP hop)
-    #    Treat admins as premium; otherwise use user's plan
+    # 4) call our own /api/analyze (IMPORTANT: use 'content', not 'text')
     tier_for_analysis = "premium" if getattr(current, "is_admin", False) else ("pro" if getattr(current, "is_paid", False) else "demo")
-    payload = {"text": combined_text, "tier": tier_for_analysis, "want_deep_dive": True}
+    payload = {"content": combined_text, "tier": tier_for_analysis, "filename": (filenames[0] if filenames else None)}
 
     try:
         async with httpx.AsyncClient(app=app, base_url="http://internal") as client:
             r = await client.post("/api/analyze", json=payload, timeout=120.0)
         if not r.is_success:
-            body = r.text
-            raise RuntimeError(f"/api/analyze {r.status_code}: {body[:500]}")
+            raise RuntimeError(f"/api/analyze {r.status_code}: {r.text[:400]}")
         analysis = r.json()
         reply_md = _format_analyze_to_cxo_md(analysis)
         reply = reply_md if reply_md.strip() else "No recommendations were generated."
     except Exception as e:
-        # graceful fallback; still reply something
         reply = f"Received {len(filenames)} file(s). Could not run full analysis.\n\nError: {e}"
 
     # 5) store assistant message & respond
@@ -641,16 +591,8 @@ async def chat_send(
     db.add(am); db.commit(); db.refresh(am)
 
     _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(filenames)}")
-
-    return {
-        "session_id": sess.id,
-        "assistant": {
-            "id": am.id,
-            "role": am.role,
-            "content": am.content,
-            "created_at": am.created_at.isoformat() + "Z",
-        },
-    }
+    return {"session_id": sess.id,
+            "assistant": {"id": am.id, "role": am.role, "content": am.content, "created_at": am.created_at.isoformat()+"Z"}}
 
 # Mount /api
 app.include_router(api)
