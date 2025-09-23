@@ -69,23 +69,18 @@ from caio_brains.registry import brain_registry
 # ------------------------------------------------------------------------------
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
 
-origins: List[str] = []
-if getattr(settings, "CORS_ORIGINS", None):
-    origins += [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
-extra = (os.getenv("ALLOWED_ORIGINS") or "").strip()
-if extra:
-    origins += [o.strip() for o in extra.split(",") if o.strip()]
-if not origins:
-    origins = ["*"]
+allowed = settings.ALLOWED_ORIGINS_LIST  # safe list
+# if you want a permissive fallback in DEBUG:
+if not allowed and getattr(settings, "DEBUG", False):
+    allowed = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=allowed,
     allow_credentials=True,
-    allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
-)
-
+)   
 @app.options("/{path:path}")
 def options_ok(path: str):
     return PlainTextResponse("ok")
