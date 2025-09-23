@@ -2,8 +2,8 @@
 """
 CAIO Orchestrator Backend
  - Auth, Profile, Public Config
- - Analyze (brains + aggregator)
- - Premium Chat (sessioned)
+ - Analyze (brains + aggregator) with safe fallbacks
+ - Premium Chat (sessioned) returning Markdown (no FE change needed)
  - Health/Ready
 """
 
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
 from fastapi import (
-    FastAPI, APIRouter, Depends, HTTPException, Request, Header, Query,
+    FastAPI, APIRouter, Depends, HTTPException, Request, Query,
     UploadFile, File, Form
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -179,9 +179,8 @@ def _caps_for_tier(tier: str) -> Dict[str, int]:
     return _caps_for_tier("demo")
 
 def _public_config_from_env() -> Dict[str, Any]:
-    import json as _json
     try:
-        pricing = _json.loads(os.getenv("PRICING_JSON", "")) or {}
+        pricing = json.loads(os.getenv("PRICING_JSON", "")) or {}
     except Exception:
         pricing = {}
     if not pricing:
@@ -283,7 +282,6 @@ def api_login(body: AuthLogin, db=Depends(get_db)):
 
 @api.get("/profile", response_model=Me)
 def api_profile(current: User = Depends(get_current_user)):
-    # treat admin as premium regardless of DB tier
     tier_val = (getattr(current, "plan_tier", None) or ("pro" if getattr(current, "is_paid", False) else "demo"))
     if getattr(current, "is_admin", False):
         tier_val = "premium"
@@ -323,10 +321,7 @@ def _safe_head_rows(rows: List[List[Any]], n: int = 25) -> str:
     return "\n".join(out)
 
 async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
-    """
-    Best-effort text extraction (no pandas required).
-    Truncates generously to avoid token blowups.
-    """
+    """Best-effort text extraction without pandas. Truncates to avoid token blowups."""
     if not files:
         return ""
     chunks: List[str] = []
@@ -403,12 +398,8 @@ async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
     return "\n".join(chunks).strip()
 
 def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
-    """
-    Convert /api/analyze JSON into CXO markdown blocks the FE can display (fallback).
-    """
+    """Turn analyze JSON into CXO markdown blocks (chat-friendly)."""
     lines: List[str] = []
-
-    # Flexible extraction from either top-level keys or combined.aggregate
     combined = resp.get("combined") or {}
     agg = combined.get("aggregate") or {}
     collective = resp.get("collective_insights") or agg.get("collective") or agg.get("collective_insights") or []
@@ -425,29 +416,13 @@ def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
         lines.append(f"## {role}")
         if rlist:
             lines.append("### Recommendations")
-            for i, r in enumerate(rlist, 1):
+            for i, r in enumerate(rlist[:6], 1):
                 lines.append(f"{i}. {r}")
         else:
             lines.append("_No actionable data found._")
         lines.append("")
 
     return "\n".join(lines).strip()
-
-def _build_structured_from_analysis(resp: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize the analyze response into a compact structure the FE can consume.
-    """
-    combined = resp.get("combined") or {}
-    agg = combined.get("aggregate") or {}
-    collective = resp.get("collective_insights") or agg.get("collective") or agg.get("collective_insights") or []
-    by_role = resp.get("cxo_recommendations") or agg.get("recommendations_by_role") or {}
-
-    roles = ["CFO", "CHRO", "COO", "CMO", "CPO"]
-    return {
-        "render_version": "v2",
-        "collective_insights": list(collective or []),
-        "recommendations_by_role": {r: list(by_role.get(r) or []) for r in roles},
-    }
 
 def _fallback_recs(role: str, text: str) -> List[str]:
     t = (text or "").lower()
@@ -465,23 +440,23 @@ def _fallback_recs(role: str, text: str) -> List[str]:
             ]
     elif role == "COO":
         recs += [
-            "Map top 5 bottlenecks (lead time, error rate, rework) with owners and SLAs.",
-            "Set a weekly ops dashboard; track throughput, defects, backlog, and SLA.",
+            "Map top 5 bottlenecks with owners, SLAs, and weekly review.",
+            "Stand up an ops dashboard: throughput, defects, backlog, SLA.",
         ]
     elif role == "CHRO":
         recs += [
-            "Run a 9-box talent review and publish 2-role deep succession slates.",
-            "Launch quarterly performance calibration and simplify ratings to 3 bands.",
+            "Run a 9-box talent review; publish 2-role deep succession slates.",
+            "Quarterly calibration; simplify ratings to 3 bands tied to pay.",
         ]
     elif role == "CMO":
         recs += [
             "Audit CAC/LTV by channel; reallocate 15% from bottom quartile to top.",
-            "Stand up a win/loss program and refresh ICP with 5 recent customer calls.",
+            "Spin up win/loss + ICP refresh from 5 recent customer calls.",
         ]
     elif role == "CPO":
         recs += [
-            "Define 3 business outcomes and map product bets to outcomes with owners.",
-            "Establish a discovery cadence (weekly) with 5 user interviews per cycle.",
+            "Define 3 outcomes; align product bets with owners and metrics.",
+            "Weekly discovery cadence; 5 user interviews per cycle.",
         ]
     return recs
 
@@ -519,7 +494,7 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
         out = fn({"document_excerpt": excerpt, "tier": tier}) or {}
         role = (out.get("role") or brain_name).upper()
 
-        # If a brain ever returns an error string (defensive)
+        # Defensive: if brain returned an error-like string
         raw_text_error = ""
         if isinstance(out, str) and out.startswith("[OPENROUTER"):
             raw_text_error = out
@@ -539,10 +514,9 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     collective = list(agg.get("collective") or agg.get("collective_insights") or [])
     recs_by_role = dict(agg.get("recommendations_by_role") or {})
 
-    # Fallbacks if the aggregator returns nothing
+    # Fallbacks if aggregator empty
     if not collective:
         collective = [r["topline_insight"] for r in raw_brain_outputs if r.get("topline_insight")]
-
     if not recs_by_role:
         recs_by_role = {r["role"]: list(r.get("recommendations") or []) for r in raw_brain_outputs}
 
@@ -560,6 +534,7 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     _log_usage(db, current.id, "/api/analyze", meta=f"tier={tier}")
     job_id = str(uuid.uuid4())
     return {"job_id": job_id, "combined": combined_dict}
+
 
 # (Optional) Admin-only debug endpoint
 @api.post("/debug/brains")
@@ -634,9 +609,8 @@ async def chat_send(
 ):
     """
     Accepts multipart (message + files), extracts text, calls analyze directly,
-    and stores both user and assistant messages.
-    Uses only primitive copies of ORM fields post-commit (avoids DetachedInstanceError).
-    Returns structured JSON for FE (with markdown fallback).
+    stores user + assistant messages, and returns **Markdown** for instant FE rendering.
+    Uses only primitive IDs post-commit to avoid DetachedInstanceError.
     """
     # 1) ensure/create session
     if session_id:
@@ -697,41 +671,53 @@ async def chat_send(
         analysis = api_analyze(doc=doc, db=db, current=current)
         analysis_dict = analysis if isinstance(analysis, dict) else analysis.model_dump()
 
-        # Build both: structured JSON (for FE) and markdown (fallback)
-        structured = _build_structured_from_analysis(analysis_dict)
-        reply_md = _format_analyze_to_cxo_md(analysis_dict)
+        # Build Markdown for chat bubble
+        reply_md = _format_analyze_to_cxo_md(analysis_dict).strip()
 
-        if (structured.get("collective_insights") or any(structured["recommendations_by_role"].values())):
-            reply_content = json.dumps(structured, ensure_ascii=False)
-            reply_is_json = True
-        else:
-            reply_content = reply_md if reply_md.strip() else "No actionable data found."
-            reply_is_json = False
+        # Robust fallback if formatter returns empty
+        if not reply_md:
+            combined = analysis_dict.get("combined", {})
+            agg = (combined.get("aggregate") or {})
+            collective = agg.get("collective") or []
+            by_role = agg.get("recommendations_by_role") or {}
+            if collective or any(by_role.values()):
+                lines = []
+                if collective:
+                    lines.append("## Collective Insights")
+                    for i, c in enumerate(collective[:10], 1):
+                        lines.append(f"{i}. {c}")
+                    lines.append("")
+                for role in ["CFO","CHRO","COO","CMO","CPO"]:
+                    recs = list(by_role.get(role) or [])
+                    lines.append(f"## {role}")
+                    if recs:
+                        for i, r in enumerate(recs[:6], 1):
+                            lines.append(f"{i}. {r}")
+                    else:
+                        lines.append("_No actionable data found._")
+                    lines.append("")
+                reply_md = "\n".join(lines).strip()
+
+        reply_content = reply_md if reply_md else "No actionable data found."
 
     except Exception as e:
         reply_content = f"Received {len(filenames)} file(s). Could not run full analysis.\n\nError: {e}"
-        reply_is_json = False
 
-    # 5) assistant message (store JSON-string or markdown)
+    # 5) assistant message
     am = ChatMessage(session_id=sess_id, role="assistant", content=reply_content, created_at=datetime.utcnow())
     db.add(am); db.commit(); db.refresh(am)
 
-    _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(filenames)};json={reply_is_json}")
+    _log_usage(db, current.id, "/api/chat/send", meta=f"files={len(filenames)};md=true")
 
-    # Return both: string content and parsed object (if JSON)
-    resp_payload = {
+    return {
         "session_id": sess_id,
         "assistant": {
             "id": int(am.id),
             "role": am.role,
-            "content": am.content,
+            "content": am.content,  # markdown chat can display
             "created_at": am.created_at.isoformat() + "Z",
         },
     }
-    if reply_is_json:
-        resp_payload["assistant"]["content_json"] = structured
-
-    return resp_payload
 
 
 # ==============================================================================
