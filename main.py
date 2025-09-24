@@ -79,55 +79,60 @@ from brains.registry import brain_registry
 # App & CORS
 # ==============================================================================
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
+# Avoid 307/308 redirect that can omit CORS headers
+app.router.redirect_slashes = False
 
 from starlette.middleware.cors import CORSMiddleware
-import os
+from starlette.responses import PlainTextResponse
+import os, re
 
-# 1) Base allow-list (from settings or explicit list)
-allowed = list(getattr(settings, "ALLOWED_ORIGINS_LIST", []) or [])
-if not allowed:
-    # Fallback to explicit production origins (yours)
+# 1) Load and normalize allowed origins
+allowed = getattr(settings, "ALLOWED_ORIGINS_LIST", None)
+
+# If it’s a comma-separated string, split it. If None, use defaults.
+if isinstance(allowed, str):
+    allowed = [o.strip() for o in allowed.split(",") if o.strip()]
+elif isinstance(allowed, (tuple, set)):
+    allowed = list(allowed)
+elif not isinstance(allowed, list) or not allowed:
     allowed = [
         "https://caio-frontend.vercel.app",
         "http://localhost:3000",
         "https://caioai.netlify.app",
     ]
 
-# 2) Optional: Vercel / Netlify preview subdomains
-#    (keeps production origins explicit, previews via regex)
+# 2) Optional preview domains (Vercel/Netlify)
 allow_origin_regex = r"^https://([a-z0-9-]+\.)?(vercel\.app|netlify\.app)$"
 
-# 3) Debug: allow everything (must not combine '*' with allow_credentials=True)
-debug_allow_all = False
-if not getattr(settings, "PRODUCTION", True):
-    # Respect your previous behavior: when DEBUG, allow all
-    debug_allow_all = True
+# 3) Debug “allow all” (avoid '*' with credentials=True)
+debug_mode = bool(getattr(settings, "DEBUG", False) or not getattr(settings, "PRODUCTION", True))
+if debug_mode:
+    # In debug, allow any origin without credentials
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[],                 # none explicit
+        allow_origin_regex=r".*",         # allow all origins
+        allow_credentials=False,          # cannot combine '*' with credentials
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["Content-Disposition"],
+        max_age=86400,
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed,            # explicit prod list
+        allow_origin_regex=allow_origin_regex,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With", "Origin", "User-Agent", "Cache-Control", "Pragma", "*"],
+        expose_headers=["Content-Disposition"],
+        max_age=86400,
+    )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[] if debug_allow_all else allowed,
-    allow_origin_regex=r".*" if debug_allow_all else allow_origin_regex,
-    allow_credentials=not debug_allow_all,  # credentials not allowed with wildcard
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=[
-        "Authorization",
-        "Content-Type",
-        "Accept",
-        "X-Requested-With",
-        "Origin",
-        "User-Agent",
-        "Cache-Control",
-        "Pragma",
-        "*",
-    ],
-    expose_headers=["Content-Disposition"],
-    max_age=86400,
-)
-
+# Always 200 for preflight (covers any path)
 @app.options("/{path:path}")
 def options_ok(path: str):
-    # Ensure Render returns a 200 for preflight even if the route doesn't exist
-    from starlette.responses import PlainTextResponse
     return PlainTextResponse("ok")
 
 # ==============================================================================
