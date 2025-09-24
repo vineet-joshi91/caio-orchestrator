@@ -409,9 +409,21 @@ def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
     """
     combined = resp.get("combined") or {}
     agg = combined.get("aggregate") or {}
-    collective = resp.get("collective_insights") or agg.get("collective") or agg.get("collective_insights") or []
-    recs_by_role = resp.get("cxo_recommendations") or agg.get("recommendations_by_role") or {}
-
+    
+    collective = (
+        resp.get("collective_insights")
+        or agg.get("collective")
+        or agg.get("collective_insights")
+        or []
+    )
+    
+    recs_by_role = (
+        resp.get("recommendations_by_role")
+        or resp.get("cxo_recommendations")
+        or agg.get("recommendations_by_role")
+        or agg.get("cxo_recommendations")
+        or {}
+    )
     # Build role -> insights from CombinedInsights.insights[]
     role_insights: Dict[str, List[str]] = {r: [] for r in ["CFO", "CHRO", "COO", "CMO", "CPO"]}
     try:
@@ -562,8 +574,10 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     )
     combined_dict = combined.model_dump() if hasattr(combined, "model_dump") else combined.dict()
     combined_dict["aggregate"] = {
-        "collective": collective,
-        "recommendations_by_role": recs_by_role,
+    "collective": collective,
+    "collective_insights": collective,            # NEW mirror
+    "recommendations_by_role": recs_by_role,
+    "cxo_recommendations": recs_by_role,          # NEW mirror
     }
 
     _log_usage(db, current.id, "/api/analyze", meta=f"tier={tier}")
@@ -711,10 +725,34 @@ async def chat_send(
 
         # Robust fallback if formatter returns empty
         if not reply_md:
-            combined = analysis_dict.get("combined", {})
+            combined = analysis_dict.get("combined", {}) or {}
             agg = (combined.get("aggregate") or {})
-            collective = agg.get("collective") or []
-            by_role = agg.get("recommendations_by_role") or {}
+            
+            collective = (
+                analysis_dict.get("collective_insights")
+                or agg.get("collective")
+                or agg.get("collective_insights")
+                or []
+            )
+            
+            by_role = (
+                analysis_dict.get("recommendations_by_role")
+                or analysis_dict.get("cxo_recommendations")
+                or agg.get("recommendations_by_role")
+                or agg.get("cxo_recommendations")
+                or {}
+            )
+            
+            # belt & suspenders: if somehow empty, derive from combined.insights
+            if not by_role and isinstance(combined.get("insights"), list):
+                tmp = {}
+                for it in combined["insights"]:
+                    r = (it.get("role") or "").upper()
+                    recs = list(it.get("recommendations") or [])
+                    if r and recs:
+                        tmp[r] = recs
+                by_role = tmp
+
             if collective or any(by_role.values()):
                 lines = []
                 if collective:
@@ -750,6 +788,7 @@ async def chat_send(
             "id": int(am.id),
             "role": am.role,
             "content": am.content,  # markdown chat can display
+            "content_json": analysis_dict,
             "created_at": am.created_at.isoformat() + "Z",
         },
     }

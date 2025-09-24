@@ -105,6 +105,10 @@ def aggregate_brain_outputs(
         "collective_insights": toplines,
         "cxo_recommendations": cxo_recs
     }
+    
+    out["collective"] = out["collective_insights"]
+    out["recommendations_by_role"] = out["cxo_recommendations"]
+
     if caps.get("include_deep_dive") and deep_dive:
         out["deep_dive"] = deep_dive
     return out
