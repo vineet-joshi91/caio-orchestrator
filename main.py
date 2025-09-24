@@ -524,7 +524,7 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
         UsageLog.timestamp >= start,
         UsageLog.timestamp < end,
     ).count()
-    if used >= caps["analyze_per_day"]:
+    if used >= caps["max_analyzes_per_day"]:
         raise HTTPException(status_code=429, detail=f"Daily analyze cap reached for tier '{tier}'")
 
     excerpt = (doc.content or "")[:caps["max_extract_chars"]]
@@ -553,10 +553,16 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
         if not recs:
             recs = _fallback_recs(role, excerpt)
 
-        raw_brain_outputs.append({"role": role, "topline_insight": topline, "recommendations": recs})
+        raw_brain_outputs.append({
+            "role": role,
+            "topline_insight": topline,
+            "recommendations": recs,   # full list preserved here
+            # keep a slot for future raw rationale if you wire it through brains
+            "raw": (out.get("raw") or None),
+        })
         insights.append(Insight(role=role, summary=topline, recommendations=recs))
 
-    # ---- aggregate ----
+    # ---- aggregate (tier-capped summary lists) ----
     agg = aggregate_brain_outputs(raw_brain_outputs, tier=tier) or {}
     collective = list(agg.get("collective") or agg.get("collective_insights") or [])
     recs_by_role = dict(agg.get("recommendations_by_role") or {})
@@ -567,6 +573,7 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     if not recs_by_role:
         recs_by_role = {r["role"]: list(r.get("recommendations") or []) for r in raw_brain_outputs}
 
+    # ---- build combined + details_by_role (full, uncapped) ----
     combined = CombinedInsights(
         document_filename=doc.filename,
         overall_summary="Combined insights across CXO brains.",
@@ -574,16 +581,29 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     )
     combined_dict = combined.model_dump() if hasattr(combined, "model_dump") else combined.dict()
     combined_dict["aggregate"] = {
-    "collective": collective,
-    "collective_insights": collective,            # NEW mirror
-    "recommendations_by_role": recs_by_role,
-    "cxo_recommendations": recs_by_role,          # NEW mirror
+        "collective": collective,
+        "collective_insights": collective,           # mirror for older FE
+        "recommendations_by_role": recs_by_role,     # tier-capped (3/5/1 etc.)
+        "cxo_recommendations": recs_by_role,         # mirror for older FE
     }
+
+    # Full recommendations per role for Premium/Admin details panel
+    details_by_role: Dict[str, Dict[str, Any]] = {}
+    for r in raw_brain_outputs:
+        role_key = (r.get("role") or "").upper()
+        if not role_key:
+            continue
+        details_by_role[role_key] = {
+            # use brain topline/summary for details; FE already labels it "Summary"
+            "summary": r.get("topline_insight") or None,
+            "recommendations": list(r.get("recommendations") or []),  # FULL list, no cap
+            "raw": (r.get("raw") or None),  # truncate upstream if you begin filling this
+        }
+    combined_dict["details_by_role"] = details_by_role
 
     _log_usage(db, current.id, "/api/analyze", meta=f"tier={tier}")
     job_id = str(uuid.uuid4())
     return {"job_id": job_id, "combined": combined_dict}
-
 
 # (Optional) Admin-only debug endpoint
 @api.post("/debug/brains")
