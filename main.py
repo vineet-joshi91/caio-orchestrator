@@ -7,7 +7,7 @@ CAIO Orchestrator Backend
  - Health/Ready
 """
 
-import os
+import os, re
 import io
 import csv
 import json
@@ -80,22 +80,55 @@ from brains.registry import brain_registry
 # ==============================================================================
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
 
-allowed = settings.ALLOWED_ORIGINS_LIST
-if not allowed and getattr(settings, "DEBUG", False):
-    allowed = ["*"]
+from starlette.middleware.cors import CORSMiddleware
+import os
+
+# 1) Base allow-list (from settings or explicit list)
+allowed = list(getattr(settings, "ALLOWED_ORIGINS_LIST", []) or [])
+if not allowed:
+    # Fallback to explicit production origins (yours)
+    allowed = [
+        "https://caio-frontend.vercel.app",
+        "http://localhost:3000",
+        "https://caioai.netlify.app",
+    ]
+
+# 2) Optional: Vercel / Netlify preview subdomains
+#    (keeps production origins explicit, previews via regex)
+allow_origin_regex = r"^https://([a-z0-9-]+\.)?(vercel\.app|netlify\.app)$"
+
+# 3) Debug: allow everything (must not combine '*' with allow_credentials=True)
+debug_allow_all = False
+if not getattr(settings, "PRODUCTION", True):
+    # Respect your previous behavior: when DEBUG, allow all
+    debug_allow_all = True
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed,
-    allow_credentials=True,
+    allow_origins=[] if debug_allow_all else allowed,
+    allow_origin_regex=r".*" if debug_allow_all else allow_origin_regex,
+    allow_credentials=not debug_allow_all,  # credentials not allowed with wildcard
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Accept",
+        "X-Requested-With",
+        "Origin",
+        "User-Agent",
+        "Cache-Control",
+        "Pragma",
+        "*",
+    ],
+    expose_headers=["Content-Disposition"],
+    max_age=86400,
 )
 
 @app.options("/{path:path}")
 def options_ok(path: str):
+    # Ensure Render returns a 200 for preflight even if the route doesn't exist
+    from starlette.responses import PlainTextResponse
     return PlainTextResponse("ok")
-
 
 # ==============================================================================
 # Startup warmup (DB)
