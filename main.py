@@ -170,9 +170,9 @@ def _caps_for_tier(tier: str) -> Dict[str, int]:
                 "uploads_per_day": _iget("UPLOADS_PER_DAY_PAID", 50),
                 "max_extract_chars": _iget("MAX_EXTRACT_CHARS_PRO", 12000),
                 "max_file_mb": _iget("MAX_FILE_MB_PRO", 15)}
-    if t == "premium":
-        return {"analyze_per_day": _iget("PRO_QUERIES_PER_DAY", 50),
-                "chat_msgs_per_day": _iget("PREMIUM_MSGS_PER_DAY", 50),
+    if t in ("premium", "admin"):
+        return {"analyze_per_day": None,
+                "chat_msgs_per_day": None,
                 "uploads_per_day": _iget("UPLOADS_PER_DAY_PAID", 50),
                 "max_extract_chars": _iget("MAX_EXTRACT_CHARS_PRO", 12000),
                 "max_file_mb": _iget("MAX_FILE_MB_PRO", 15)}
@@ -516,7 +516,7 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     tier = (doc.tier or getattr(current, "plan_tier", None) or ("pro" if current.is_paid else "demo")).lower()
     caps = _caps_for_tier(tier)
 
-    # daily cap
+    # daily cap (unlimited when limit is None)
     start, end = _today_bounds_utc()
     used = db.query(UsageLog).filter(
         UsageLog.user_id == current.id,
@@ -524,7 +524,8 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
         UsageLog.timestamp >= start,
         UsageLog.timestamp < end,
     ).count()
-    if used >= caps["max_analyzes_per_day"]:
+    limit = caps.get("analyze_per_day") if isinstance(caps, dict) else getattr(caps, "analyze_per_day", None)
+    if isinstance(limit, int) and limit >= 0 and used >= limit:
         raise HTTPException(status_code=429, detail=f"Daily analyze cap reached for tier '{tier}'")
 
     excerpt = (doc.content or "")[:caps["max_extract_chars"]]
@@ -553,13 +554,7 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
         if not recs:
             recs = _fallback_recs(role, excerpt)
 
-        raw_brain_outputs.append({
-            "role": role,
-            "topline_insight": topline,
-            "recommendations": recs,   # full list preserved here
-            # keep a slot for future raw rationale if you wire it through brains
-            "raw": (out.get("raw") or None),
-        })
+        raw_brain_outputs.append({"role": role, "topline_insight": topline, "recommendations": recs})
         insights.append(Insight(role=role, summary=topline, recommendations=recs))
 
     # ---- aggregate (tier-capped summary lists) ----
@@ -573,7 +568,6 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     if not recs_by_role:
         recs_by_role = {r["role"]: list(r.get("recommendations") or []) for r in raw_brain_outputs}
 
-    # ---- build combined + details_by_role (full, uncapped) ----
     combined = CombinedInsights(
         document_filename=doc.filename,
         overall_summary="Combined insights across CXO brains.",
@@ -582,22 +576,21 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     combined_dict = combined.model_dump() if hasattr(combined, "model_dump") else combined.dict()
     combined_dict["aggregate"] = {
         "collective": collective,
-        "collective_insights": collective,           # mirror for older FE
-        "recommendations_by_role": recs_by_role,     # tier-capped (3/5/1 etc.)
-        "cxo_recommendations": recs_by_role,         # mirror for older FE
+        "collective_insights": collective,            # mirror for older FE
+        "recommendations_by_role": recs_by_role,      # tier-capped (3/5/1 etc.)
+        "cxo_recommendations": recs_by_role,          # mirror for older FE
     }
 
-    # Full recommendations per role for Premium/Admin details panel
-    details_by_role: Dict[str, Dict[str, Any]] = {}
+    # Full, uncapped details per role for Premium/Admin
+    details_by_role = {}
     for r in raw_brain_outputs:
         role_key = (r.get("role") or "").upper()
         if not role_key:
             continue
         details_by_role[role_key] = {
-            # use brain topline/summary for details; FE already labels it "Summary"
             "summary": r.get("topline_insight") or None,
-            "recommendations": list(r.get("recommendations") or []),  # FULL list, no cap
-            "raw": (r.get("raw") or None),  # truncate upstream if you begin filling this
+            "recommendations": list(r.get("recommendations") or []),  # FULL list
+            "raw": r.get("raw") or None,
         }
     combined_dict["details_by_role"] = details_by_role
 
