@@ -715,6 +715,7 @@ async def chat_send(
 
     # 4) DIRECT analyze call (no internal HTTP)
     tier_for_analysis = "premium" if getattr(current, "is_admin", False) else ("pro" if getattr(current, "is_paid", False) else "demo")
+    analysis_dict: Dict[str, Any] = {}
     try:
         doc = DocumentIn(content=combined_text, filename=(filenames[0] if filenames else None), tier=tier_for_analysis)
         analysis = api_analyze(doc=doc, db=db, current=current)
