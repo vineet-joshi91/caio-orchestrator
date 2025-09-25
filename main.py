@@ -22,6 +22,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse
 
 # Optional parsers (used if available; code is resilient if missing)
 try:
@@ -508,82 +509,129 @@ def _fallback_recs(role: str, text: str) -> List[str]:
     return recs
 
 @api.post("/analyze", response_model=AnalyzeResponse)
-def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get_current_user)):
+async def api_analyze(
+    request: Request,
+    # JSON body (optional): keep for clients that still send JSON
+    doc: Optional[DocumentIn] = None,
+    # Multipart form fields (Dashboard)
+    text: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
+    db=Depends(get_db),
+    current: User = Depends(get_current_user),
+):
     """
-    Run brains + aggregator. If aggregator or brains return nothing,
-    synthesize meaningful fallbacks so FE always renders content.
+    Accepts either:
+      - multipart/form-data: fields 'text' and optional 'file'/'files' (Dashboard)
+      - application/json: DocumentIn (legacy/other clients)
+    Returns: AnalyzeResponse { job_id, combined:{ overall_summary, insights[], aggregate{...}, details_by_role{...} } }
     """
-    tier = (doc.tier or getattr(current, "plan_tier", None) or ("pro" if current.is_paid else "demo")).lower()
-    caps = _caps_for_tier(tier)
 
-    # daily cap
-    start, end = _today_bounds_utc()
-    used = db.query(UsageLog).filter(
-        UsageLog.user_id == current.id,
-        UsageLog.endpoint == "/api/analyze",
-        UsageLog.timestamp >= start,
-        UsageLog.timestamp < end,
-    ).count()
-    if used >= caps["analyze_per_day"]:
-        raise HTTPException(status_code=429, detail=f"Daily analyze cap reached for tier '{tier}'")
+    # -------- 1) Normalize input (multipart OR JSON) --------
+    content = ""
+    filename = None
+    tier = ("premium" if getattr(current, "is_admin", False)
+            else ("pro" if getattr(current, "is_paid", False) else "demo"))
 
-    excerpt = (doc.content or "")[:caps["max_extract_chars"]]
+    if (text is not None) or file is not None or (files is not None):
+        # Multipart path
+        file_list: List[UploadFile] = []
+        if file is not None:
+            file_list.append(file)
+        if files:
+            file_list.extend(files)
 
-    # ---- run brains ----
+        appendix = await _extract_text_from_files(file_list)
+        content = ((text or "") + (("\n\n" + appendix) if appendix else "")).strip()
+
+        # best filename guess
+        for f in file_list:
+            if getattr(f, "filename", None):
+                filename = f.filename
+                break
+        if not filename:
+            filename = ("prompt.txt" if text else "input.txt")
+    else:
+        # JSON path
+        if doc is None:
+            try:
+                body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=415, detail="Unsupported content-type. Send JSON or multipart/form-data.")
+            try:
+                doc = DocumentIn(**(body or {}))
+            except Exception:
+                raise HTTPException(status_code=422, detail="Invalid payload for DocumentIn.")
+
+        content = (doc.content or "").strip()
+        filename = doc.filename or "input.txt"
+        tier = (doc.tier or tier).lower()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="No content provided for analysis.")
+
+    excerpt = content[:16000]
+
+    # -------- 2) Run brains --------
     raw_brain_outputs: List[Dict[str, Any]] = []
-    insights: List[Insight] = []
-    roles = ("CFO", "CHRO", "COO", "CMO", "CPO")
-
-    for brain_name in roles:
-        fn = brain_registry.get(brain_name)
+    for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
+        fn = brain_registry.get(role)
         if not fn:
             continue
-        out = fn({"document_excerpt": excerpt, "tier": tier}) or {}
-        role = (out.get("role") or brain_name).upper()
+        try:
+            out = fn({"document_excerpt": excerpt, "tier": tier})
+            # normalize role key presence
+            if isinstance(out, dict) and not out.get("role"):
+                out["role"] = role
+            raw_brain_outputs.append(out)
+        except Exception as e:
+            raw_brain_outputs.append({"role": role, "summary": "", "recommendations": [], "error": str(e)})
 
-        # Defensive: if brain returned an error-like string
-        raw_text_error = ""
-        if isinstance(out, str) and out.startswith("[OPENROUTER"):
-            raw_text_error = out
-
-        topline = (out.get("topline_insight") or out.get("summary") or raw_text_error or "").strip()
-        recs = list(out.get("recommendations") or [])
-
-        # Fallback per role if empty
-        if not recs:
-            recs = _fallback_recs(role, excerpt)
-
-        raw_brain_outputs.append({"role": role, "topline_insight": topline, "recommendations": recs})
-        insights.append(Insight(role=role, summary=topline, recommendations=recs))
-
-    # ---- aggregate ----
-    agg = aggregate_brain_outputs(raw_brain_outputs, tier=tier) or {}
-    collective = list(agg.get("collective") or agg.get("collective_insights") or [])
-    recs_by_role = dict(agg.get("recommendations_by_role") or {})
-
-    # Fallbacks if aggregator empty
-    if not collective:
-        collective = [r["topline_insight"] for r in raw_brain_outputs if r.get("topline_insight")]
-    if not recs_by_role:
-        recs_by_role = {r["role"]: list(r.get("recommendations") or []) for r in raw_brain_outputs}
-
-    combined = CombinedInsights(
-        document_filename=doc.filename,
-        overall_summary="Combined insights across CXO brains.",
-        insights=insights,
+    # -------- 3) Aggregate --------
+    combined: Dict[str, Any] = aggregate_brain_outputs(raw_brain_outputs, document_filename=filename) or {}
+    agg = combined.get("aggregate") or {}
+    recs_by_role: Dict[str, List[str]] = dict(
+        (agg.get("recommendations_by_role") or agg.get("cxo_recommendations") or {})
     )
-    combined_dict = combined.model_dump() if hasattr(combined, "model_dump") else combined.dict()
-    combined_dict["aggregate"] = {
-    "collective": collective,
-    "collective_insights": collective,            # NEW mirror
-    "recommendations_by_role": recs_by_role,
-    "cxo_recommendations": recs_by_role,          # NEW mirror
-    }
 
-    _log_usage(db, current.id, "/api/analyze", meta=f"tier={tier}")
+    # -------- 4) Guarantee at least one recommendation per role --------
+    for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
+        lst = list(recs_by_role.get(role) or [])
+        if not lst:
+            # try raw brain output first
+            raw = next((r for r in raw_brain_outputs if (r.get("role") or "").upper() == role), None)
+            first = None
+            if raw:
+                arr = list(raw.get("recommendations") or [])
+                if arr:
+                    first = arr[0]
+            # fallback if still empty
+            if not first:
+                fb = _fallback_recs(role, excerpt)
+                if fb:
+                    first = fb[0]
+            if first:
+                recs_by_role[role] = [first]
+
+    agg["recommendations_by_role"] = recs_by_role
+    agg.setdefault("cxo_recommendations", recs_by_role)
+    combined["aggregate"] = agg
+
+    # -------- 5) Mirror into details_by_role for Premium/Admin detail cards --------
+    details = combined.setdefault("details_by_role", {})
+    for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
+        block = details.get(role) or {}
+        if not (block.get("recommendations") or []):
+            first = (recs_by_role.get(role) or [None])[0]
+            if first:
+                block["recommendations"] = [first]
+                details[role] = block
+    combined["details_by_role"] = details
+
+    # -------- 6) Ship it --------
     job_id = str(uuid.uuid4())
-    return {"job_id": job_id, "combined": combined_dict}
-
+    _log_usage(db, current.id, "/api/analyze", "ok")
+    return AnalyzeResponse(job_id=job_id, combined=CombinedInsights(**combined))
 
 # (Optional) Admin-only debug endpoint
 @api.post("/debug/brains")
