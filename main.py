@@ -87,7 +87,7 @@ from starlette.responses import PlainTextResponse
 import os, re
 
 # 1) Load and normalize allowed origins
-allowed = getattr(settings, "ALLOWED_ORIGINS", None)
+allowed = getattr(settings, "ALLOWED_ORIGINS_LIST", None)
 
 # If it’s a comma-separated string, split it. If None, use defaults.
 if isinstance(allowed, str):
@@ -110,7 +110,7 @@ if debug_mode:
     # In debug, allow any origin without credentials
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed,                 # none explicit
+        allow_origins=[],                 # none explicit
         allow_origin_regex=r".*",         # allow all origins
         allow_credentials=False,          # cannot combine '*' with credentials
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -545,6 +545,7 @@ def _fallback_recs(role: str, text: str) -> List[str]:
         ]
     return recs
 
+
 # ---------- Core analyze logic (shared by JSON & multipart) ----------
 def _analyze_core(doc: DocumentIn, db, current: User):
     """
@@ -553,7 +554,7 @@ def _analyze_core(doc: DocumentIn, db, current: User):
     tier = (doc.tier or getattr(current, "plan_tier", None) or ("pro" if getattr(current, "is_paid", False) else "demo")).lower()
     caps = _caps_for_tier(tier)
 
-    # daily cap (if configured as int)
+    # daily cap (unlimited when limit is None)
     start, end = _today_bounds_utc()
     used = db.query(UsageLog).filter(
         UsageLog.user_id == current.id,
@@ -606,6 +607,26 @@ def _analyze_core(doc: DocumentIn, db, current: User):
     if not recs_by_role:
         recs_by_role = {r["role"]: list(r.get("recommendations") or []) for r in raw_brain_outputs}
 
+    # Ensure at least one recommendation per role
+    role_order = ("CFO", "CHRO", "COO", "CMO", "CPO")
+    for role_name in role_order:
+        recs_list = recs_by_role.get(role_name) or []
+        if not recs_list:
+            raw = next((r for r in raw_brain_outputs if (r.get("role") or "").upper() == role_name), None)
+            first = None
+            if raw:
+                arr = list(raw.get("recommendations") or [])
+                if arr:
+                    first = arr[0]
+            if not first:
+                try:
+                    fb = _fallback_recs(role_name, excerpt)
+                    first = fb[0] if fb else None
+                except Exception:
+                    first = None
+            if first:
+                recs_by_role[role_name] = [first]
+
     combined = CombinedInsights(
         document_filename=doc.filename,
         overall_summary="Combined insights across CXO brains.",
@@ -614,12 +635,12 @@ def _analyze_core(doc: DocumentIn, db, current: User):
     combined_dict = combined.model_dump() if hasattr(combined, "model_dump") else combined.dict()
     combined_dict["aggregate"] = {
         "collective": collective,
-        "collective_insights": collective,   # mirror for older FE
+        "collective_insights": collective,
         "recommendations_by_role": recs_by_role,
-        "cxo_recommendations": recs_by_role, # mirror for older FE
+        "cxo_recommendations": recs_by_role,
     }
 
-    # Full, uncapped details per role (for Premium/Admin detail panel)
+    # Full, uncapped details per role (Premium/Admin)
     details_by_role = {}
     for r in raw_brain_outputs:
         role_key = (r.get("role") or "").upper()
@@ -630,6 +651,17 @@ def _analyze_core(doc: DocumentIn, db, current: User):
             "recommendations": list(r.get("recommendations") or []),
             "raw": r.get("raw") or None,
         }
+
+    # Mirror: ensure details_by_role has at least one recommendation
+    for role_name in role_order:
+        block = details_by_role.get(role_name) or {}
+        arr = list(block.get("recommendations") or [])
+        if not arr:
+            agg_first = (recs_by_role.get(role_name) or [None])[0]
+            if agg_first:
+                block["recommendations"] = [agg_first]
+                details_by_role[role_name] = block
+
     combined_dict["details_by_role"] = details_by_role
 
     _log_usage(db, current.id, "/api/analyze", meta=f"tier={tier}")
@@ -637,27 +669,19 @@ def _analyze_core(doc: DocumentIn, db, current: User):
     return {"job_id": job_id, "combined": combined_dict}
 
 
-# ---------- New universal /api/analyze that accepts JSON or multipart ----------
 @api.post("/analyze", response_model=AnalyzeResponse)
 async def api_analyze(request: Request, db=Depends(get_db), current: User = Depends(get_current_user)):
     """
-    Accepts either:
-      1) JSON body: { filename, content, mime_type?, tier? }  (DocumentIn)
-      2) multipart/form-data with fields:
-         - text: optional
-         - file / files: optional uploads (PDF/DOCX/TXT/CSV/XLSX)
-         - brains: ignored here (we always run all 5; aggregator will tier-cap)
+    Accepts JSON (DocumentIn) or multipart/form-data with fields:
+      - text: optional
+      - file/files: uploads (PDF/DOCX/TXT/CSV/XLSX)
     """
     ct = (request.headers.get("content-type") or "").lower()
 
-    # (A) multipart path – used by Dashboard
     if "multipart/form-data" in ct:
         form = await request.form()
         text = (form.get("text") or "").strip()
-
-        # collect any uploaded files from the form
         files = []
-        # Starlette FormData supports .multi_items(); fallback to .items() if not
         try:
             items_iter = form.multi_items()
         except Exception:
@@ -665,20 +689,14 @@ async def api_analyze(request: Request, db=Depends(get_db), current: User = Depe
         for key, val in items_iter:
             if key in ("file", "files") and hasattr(val, "filename"):
                 files.append(val)
-
         appendix = await _extract_text_from_files(files)
         combined_text = (text + (("\n\n" + appendix) if appendix else "")).strip()
-
-        # choose a representative filename if any file present
         first_name = None
         for f in files:
             if getattr(f, "filename", None):
                 first_name = f.filename
                 break
-
-        # Tier is inferred from user (Premium/Admin unlimited if you later set None caps)
         tier_for_analysis = (getattr(current, "plan_tier", None) or ("pro" if getattr(current, "is_paid", False) else "demo")).lower()
-
         doc = DocumentIn(
             content=combined_text or text or "",
             filename=first_name or (text and "prompt.txt") or "input.txt",
@@ -686,7 +704,7 @@ async def api_analyze(request: Request, db=Depends(get_db), current: User = Depe
         )
         return _analyze_core(doc, db, current)
 
-    # (B) JSON path – existing clients
+    # JSON path
     try:
         body = await request.json()
     except Exception:
@@ -697,8 +715,6 @@ async def api_analyze(request: Request, db=Depends(get_db), current: User = Depe
         raise HTTPException(status_code=422, detail="Invalid payload for DocumentIn.")
     return _analyze_core(doc, db, current)
 
-
-# (Optional) Admin-only debug endpoint
 @api.post("/debug/brains")
 def debug_brains(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get_current_user)):
     """Returns each brain's raw dict for quick troubleshooting (admin only)."""
@@ -911,7 +927,7 @@ async def chat_send(
 # ==============================================================================
 # Mount routers
 # ==============================================================================
-app.include_router(api)
+app.include_router(api, prefix="/api")
 if health_router:         app.include_router(health_router)
 if admin_router:          app.include_router(admin_router)
 if admin_metrics_router:  app.include_router(admin_metrics_router)
