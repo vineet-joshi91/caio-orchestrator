@@ -545,16 +545,15 @@ def _fallback_recs(role: str, text: str) -> List[str]:
         ]
     return recs
 
-@api.post("/analyze", response_model=AnalyzeResponse)
-def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get_current_user)):
+# ---------- Core analyze logic (shared by JSON & multipart) ----------
+def _analyze_core(doc: DocumentIn, db, current: User):
     """
-    Run brains + aggregator. If aggregator or brains return nothing,
-    synthesize meaningful fallbacks so FE always renders content.
+    Core pipeline: caps, run brains, aggregate, build combined payload (with details_by_role).
     """
-    tier = (doc.tier or getattr(current, "plan_tier", None) or ("pro" if current.is_paid else "demo")).lower()
+    tier = (doc.tier or getattr(current, "plan_tier", None) or ("pro" if getattr(current, "is_paid", False) else "demo")).lower()
     caps = _caps_for_tier(tier)
 
-    # daily cap (unlimited when limit is None)
+    # daily cap (if configured as int)
     start, end = _today_bounds_utc()
     used = db.query(UsageLog).filter(
         UsageLog.user_id == current.id,
@@ -569,10 +568,9 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     excerpt = (doc.content or "")[:caps["max_extract_chars"]]
 
     # ---- run brains ----
-    raw_brain_outputs: List[Dict[str, Any]] = []
-    insights: List[Insight] = []
+    raw_brain_outputs = []
+    insights = []
     roles = ("CFO", "CHRO", "COO", "CMO", "CPO")
-
     for brain_name in roles:
         fn = brain_registry.get(brain_name)
         if not fn:
@@ -580,19 +578,21 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
         out = fn({"document_excerpt": excerpt, "tier": tier}) or {}
         role = (out.get("role") or brain_name).upper()
 
-        # Defensive: if brain returned an error-like string
         raw_text_error = ""
         if isinstance(out, str) and out.startswith("[OPENROUTER"):
             raw_text_error = out
 
         topline = (out.get("topline_insight") or out.get("summary") or raw_text_error or "").strip()
         recs = list(out.get("recommendations") or [])
-
-        # Fallback per role if empty
         if not recs:
             recs = _fallback_recs(role, excerpt)
 
-        raw_brain_outputs.append({"role": role, "topline_insight": topline, "recommendations": recs})
+        raw_brain_outputs.append({
+            "role": role,
+            "topline_insight": topline,
+            "recommendations": recs,
+            "raw": out.get("raw"),
+        })
         insights.append(Insight(role=role, summary=topline, recommendations=recs))
 
     # ---- aggregate (tier-capped summary lists) ----
@@ -614,12 +614,12 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     combined_dict = combined.model_dump() if hasattr(combined, "model_dump") else combined.dict()
     combined_dict["aggregate"] = {
         "collective": collective,
-        "collective_insights": collective,            # mirror for older FE
-        "recommendations_by_role": recs_by_role,      # tier-capped (3/5/1 etc.)
-        "cxo_recommendations": recs_by_role,          # mirror for older FE
+        "collective_insights": collective,   # mirror for older FE
+        "recommendations_by_role": recs_by_role,
+        "cxo_recommendations": recs_by_role, # mirror for older FE
     }
 
-    # Full, uncapped details per role for Premium/Admin
+    # Full, uncapped details per role (for Premium/Admin detail panel)
     details_by_role = {}
     for r in raw_brain_outputs:
         role_key = (r.get("role") or "").upper()
@@ -627,7 +627,7 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
             continue
         details_by_role[role_key] = {
             "summary": r.get("topline_insight") or None,
-            "recommendations": list(r.get("recommendations") or []),  # FULL list
+            "recommendations": list(r.get("recommendations") or []),
             "raw": r.get("raw") or None,
         }
     combined_dict["details_by_role"] = details_by_role
@@ -635,6 +635,68 @@ def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get
     _log_usage(db, current.id, "/api/analyze", meta=f"tier={tier}")
     job_id = str(uuid.uuid4())
     return {"job_id": job_id, "combined": combined_dict}
+
+
+# ---------- New universal /api/analyze that accepts JSON or multipart ----------
+@api.post("/analyze", response_model=AnalyzeResponse)
+async def api_analyze(request: Request, db=Depends(get_db), current: User = Depends(get_current_user)):
+    """
+    Accepts either:
+      1) JSON body: { filename, content, mime_type?, tier? }  (DocumentIn)
+      2) multipart/form-data with fields:
+         - text: optional
+         - file / files: optional uploads (PDF/DOCX/TXT/CSV/XLSX)
+         - brains: ignored here (we always run all 5; aggregator will tier-cap)
+    """
+    ct = (request.headers.get("content-type") or "").lower()
+
+    # (A) multipart path – used by Dashboard
+    if "multipart/form-data" in ct:
+        form = await request.form()
+        text = (form.get("text") or "").strip()
+
+        # collect any uploaded files from the form
+        files = []
+        # Starlette FormData supports .multi_items(); fallback to .items() if not
+        try:
+            items_iter = form.multi_items()
+        except Exception:
+            items_iter = form.items()
+        for key, val in items_iter:
+            if key in ("file", "files") and hasattr(val, "filename"):
+                files.append(val)
+
+        appendix = await _extract_text_from_files(files)
+        combined_text = (text + (("\n\n" + appendix) if appendix else "")).strip()
+
+        # choose a representative filename if any file present
+        first_name = None
+        for f in files:
+            if getattr(f, "filename", None):
+                first_name = f.filename
+                break
+
+        # Tier is inferred from user (Premium/Admin unlimited if you later set None caps)
+        tier_for_analysis = (getattr(current, "plan_tier", None) or ("pro" if getattr(current, "is_paid", False) else "demo")).lower()
+
+        doc = DocumentIn(
+            content=combined_text or text or "",
+            filename=first_name or (text and "prompt.txt") or "input.txt",
+            tier=tier_for_analysis,
+        )
+        return _analyze_core(doc, db, current)
+
+    # (B) JSON path – existing clients
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=415, detail="Unsupported content-type. Send JSON or multipart/form-data.")
+    try:
+        doc = DocumentIn(**(body or {}))
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid payload for DocumentIn.")
+    return _analyze_core(doc, db, current)
+
 
 # (Optional) Admin-only debug endpoint
 @api.post("/debug/brains")
