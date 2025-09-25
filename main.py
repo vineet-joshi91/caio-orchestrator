@@ -849,7 +849,7 @@ async def chat_send(
 # ==============================================================================
 # Mount routers
 # ==============================================================================
-app.include_router(api, prefix="/api")
+app.include_router(api)
 if health_router:         app.include_router(health_router)
 if admin_router:          app.include_router(admin_router)
 if admin_metrics_router:  app.include_router(admin_metrics_router)
