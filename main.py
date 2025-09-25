@@ -508,12 +508,41 @@ def _fallback_recs(role: str, text: str) -> List[str]:
         ]
     return recs
 
-@api.post("/analyze", response_model=AnalyzeResponse)
+from typing import Optional, List, Dict, Any
+from fastapi import Request, Form, File, UploadFile, HTTPException, Depends
+
+# --- /api/analyze that accepts multipart + JSON, and guarantees data completeness ---
+@api.post(
+    "/analyze",
+    response_model=AnalyzeResponse,
+    openapi_extra={  # <- so /openapi.json shows multipart (helps you verify deploy)
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/DocumentIn"}
+                },
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "file": {"type": "string", "format": "binary"},
+                            "files": {
+                                "type": "array",
+                                "items": {"type": "string", "format": "binary"},
+                            },
+                        },
+                    }
+                },
+            }
+        }
+    },
+)
 async def api_analyze(
     request: Request,
-    # JSON body (optional): keep for clients that still send JSON
+    # JSON body (optional)
     doc: Optional[DocumentIn] = None,
-    # Multipart form fields (Dashboard)
+    # Multipart fields (Dashboard)
     text: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = File(None),
@@ -521,20 +550,18 @@ async def api_analyze(
     current: User = Depends(get_current_user),
 ):
     """
-    Accepts either:
-      - multipart/form-data: fields 'text' and optional 'file'/'files' (Dashboard)
-      - application/json: DocumentIn (legacy/other clients)
-    Returns: AnalyzeResponse { job_id, combined:{ overall_summary, insights[], aggregate{...}, details_by_role{...} } }
+    Accepts either multipart (Dashboard) or JSON (legacy clients) and returns AnalyzeResponse.
+    Ensures at least one recommendation per CXO in both aggregate and details_by_role.
     """
+    # ---------------- Normalize input ----------------
+    is_multipart = "multipart/form-data" in (request.headers.get("content-type") or "").lower()
 
-    # -------- 1) Normalize input (multipart OR JSON) --------
     content = ""
     filename = None
     tier = ("premium" if getattr(current, "is_admin", False)
             else ("pro" if getattr(current, "is_paid", False) else "demo"))
 
-    if (text is not None) or file is not None or (files is not None):
-        # Multipart path
+    if is_multipart or (text is not None) or (file is not None) or (files is not None):
         file_list: List[UploadFile] = []
         if file is not None:
             file_list.append(file)
@@ -544,15 +571,13 @@ async def api_analyze(
         appendix = await _extract_text_from_files(file_list)
         content = ((text or "") + (("\n\n" + appendix) if appendix else "")).strip()
 
-        # best filename guess
         for f in file_list:
             if getattr(f, "filename", None):
                 filename = f.filename
                 break
         if not filename:
-            filename = ("prompt.txt" if text else "input.txt")
+            filename = "prompt.txt" if (text or "") else "input.txt"
     else:
-        # JSON path
         if doc is None:
             try:
                 body = await request.json()
@@ -562,7 +587,6 @@ async def api_analyze(
                 doc = DocumentIn(**(body or {}))
             except Exception:
                 raise HTTPException(status_code=422, detail="Invalid payload for DocumentIn.")
-
         content = (doc.content or "").strip()
         filename = doc.filename or "input.txt"
         tier = (doc.tier or tier).lower()
@@ -572,40 +596,37 @@ async def api_analyze(
 
     excerpt = content[:16000]
 
-    # -------- 2) Run brains --------
+    # ---------------- Run brains ----------------
     raw_brain_outputs: List[Dict[str, Any]] = []
     for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
         fn = brain_registry.get(role)
         if not fn:
             continue
         try:
-            out = fn({"document_excerpt": excerpt, "tier": tier})
-            # normalize role key presence
+            out = fn({"document_excerpt": excerpt, "tier": tier}) or {}
             if isinstance(out, dict) and not out.get("role"):
                 out["role"] = role
             raw_brain_outputs.append(out)
         except Exception as e:
             raw_brain_outputs.append({"role": role, "summary": "", "recommendations": [], "error": str(e)})
 
-    # -------- 3) Aggregate --------
+    # ---------------- Aggregate ----------------
     combined: Dict[str, Any] = aggregate_brain_outputs(raw_brain_outputs, document_filename=filename) or {}
     agg = combined.get("aggregate") or {}
     recs_by_role: Dict[str, List[str]] = dict(
         (agg.get("recommendations_by_role") or agg.get("cxo_recommendations") or {})
     )
 
-    # -------- 4) Guarantee at least one recommendation per role --------
+    # ---------------- Guarantee at least 1 rec per role ----------------
     for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
         lst = list(recs_by_role.get(role) or [])
         if not lst:
-            # try raw brain output first
             raw = next((r for r in raw_brain_outputs if (r.get("role") or "").upper() == role), None)
             first = None
             if raw:
                 arr = list(raw.get("recommendations") or [])
                 if arr:
                     first = arr[0]
-            # fallback if still empty
             if not first:
                 fb = _fallback_recs(role, excerpt)
                 if fb:
@@ -617,7 +638,7 @@ async def api_analyze(
     agg.setdefault("cxo_recommendations", recs_by_role)
     combined["aggregate"] = agg
 
-    # -------- 5) Mirror into details_by_role for Premium/Admin detail cards --------
+    # Ensure details_by_role mirrors a first rec (so Premium/Admin details never empty)
     details = combined.setdefault("details_by_role", {})
     for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
         block = details.get(role) or {}
@@ -628,7 +649,7 @@ async def api_analyze(
                 details[role] = block
     combined["details_by_role"] = details
 
-    # -------- 6) Ship it --------
+    # ---------------- Respond ----------------
     job_id = str(uuid.uuid4())
     _log_usage(db, current.id, "/api/analyze", "ok")
     return AnalyzeResponse(job_id=job_id, combined=CombinedInsights(**combined))
