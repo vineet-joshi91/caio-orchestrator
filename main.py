@@ -22,7 +22,6 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
-from starlette.responses import PlainTextResponse
 
 # Optional parsers (used if available; code is resilient if missing)
 try:
@@ -77,24 +76,46 @@ from brains.registry import brain_registry
 
 
 # ==============================================================================
-# App & CORS
+# App & CORS  (hardened)
 # ==============================================================================
+def _parse_allowed_origins(val) -> List[str]:
+    """
+    Accept list/tuple/set OR comma-separated string from env/settings.
+    Returns a clean list of origins.
+    """
+    if isinstance(val, (list, tuple, set)):
+        return [str(x).strip() for x in val if str(x).strip()]
+    if isinstance(val, str):
+        # Split comma-separated env like: "https://a.com, http://localhost:3000"
+        parts = [p.strip() for p in val.split(",") if p.strip()]
+        return parts
+    return []
+
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
 
-allowed = settings.ALLOWED_ORIGINS_LIST
-if not allowed and getattr(settings, "DEBUG", False):
-    allowed = ["*"]
+allowed = _parse_allowed_origins(getattr(settings, "ALLOWED_ORIGINS_LIST", None))
+if not allowed:
+    # fallback to env var if settings is empty
+    allowed = _parse_allowed_origins(os.getenv("ALLOWED_ORIGINS", ""))
+
+# As an additional safety net, allow common hostnames via regex if list is empty.
+allow_origin_regex = None
+if not allowed:
+    allow_origin_regex = r"^https://([a-zA-Z0-9-]+\.)?vercel\.app$|^http://localhost:3000$|^https://([a-zA-Z0-9-]+\.)?netlify\.app$"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed,
+    allow_origins=allowed if allowed else [],
+    allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 @app.options("/{path:path}")
 def options_ok(path: str):
+    # CORS middleware attaches the Access-Control-* headers
     return PlainTextResponse("ok")
 
 
@@ -229,7 +250,6 @@ def health():
 def version():
     return {"version": settings.VERSION}
 
-# Fallback ready (in case health router isn't mounted)
 @app.get("/api/ready")
 def api_ready():
     return {"ok": True, "db": DB_READY, "startup": STARTUP_OK}
