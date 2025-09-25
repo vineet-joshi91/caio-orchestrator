@@ -267,7 +267,7 @@ def version():
     return {"version": settings.VERSION}
 
 # Fallback ready (in case health router isn't mounted)
-@app.get("/api/ready")
+@app.get("/ready")
 def api_ready():
     return {"ok": True, "db": DB_READY, "startup": STARTUP_OK}
 
@@ -849,7 +849,7 @@ async def chat_send(
 # ==============================================================================
 # Mount routers
 # ==============================================================================
-app.include_router(api)
+app.include_router(api, prefix="/api")
 if health_router:         app.include_router(health_router)
 if admin_router:          app.include_router(admin_router)
 if admin_metrics_router:  app.include_router(admin_metrics_router)
