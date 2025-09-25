@@ -78,24 +78,20 @@ from brains.registry import brain_registry
 # ==============================================================================
 # App & CORS  (ironclad)
 # ==============================================================================
-from typing import List
-import os
-
+# App & CORS
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
 
-def _parse_origins(val) -> List[str]:
+def _parse_origins(val):
     if isinstance(val, (list, tuple, set)):
         return [str(x).strip() for x in val if str(x).strip()]
     if isinstance(val, str):
         return [p.strip() for p in val.split(",") if p.strip()]
     return []
 
-# 1) build allow list from settings then env
 allowed = _parse_origins(getattr(settings, "ALLOWED_ORIGINS_LIST", None))
 if not allowed:
     allowed = _parse_origins(os.getenv("ALLOWED_ORIGINS", ""))
 
-# 2) safety net: exact regex for your three launch origins
 allow_origin_regex = (
     r"^(https://caio-frontend\.vercel\.app"
     r"|http://localhost:3000"
@@ -104,10 +100,10 @@ allow_origin_regex = (
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed,            # will be [] if parsing fails; regex still matches
-    allow_origin_regex=allow_origin_regex,
+    allow_origins=allowed,
+    allow_origin_regex=allow_origin_regex,   # safety net
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
