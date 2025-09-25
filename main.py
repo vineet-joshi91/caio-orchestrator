@@ -78,8 +78,8 @@ from brains.registry import brain_registry
 # ==============================================================================
 # App & CORS  (ironclad)
 # ==============================================================================
-import os
 from typing import List
+import os
 
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
 
@@ -87,17 +87,15 @@ def _parse_origins(val) -> List[str]:
     if isinstance(val, (list, tuple, set)):
         return [str(x).strip() for x in val if str(x).strip()]
     if isinstance(val, str):
-        # split comma-separated, trim each
         return [p.strip() for p in val.split(",") if p.strip()]
     return []
 
-# 1) Read from settings first, then env
+# 1) build allow list from settings then env
 allowed = _parse_origins(getattr(settings, "ALLOWED_ORIGINS_LIST", None))
 if not allowed:
     allowed = _parse_origins(os.getenv("ALLOWED_ORIGINS", ""))
 
-# 2) A precise, safe regex that always matches your three origins (belt & suspenders)
-#    This guarantees matching even if 'allowed' accidentally becomes a bad value.
+# 2) safety net: exact regex for your three launch origins
 allow_origin_regex = (
     r"^(https://caio-frontend\.vercel\.app"
     r"|http://localhost:3000"
@@ -106,7 +104,7 @@ allow_origin_regex = (
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed,            # will be [] if parsing fails — that's OK because regex covers
+    allow_origins=allowed,            # will be [] if parsing fails; regex still matches
     allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -116,7 +114,6 @@ app.add_middleware(
 
 @app.options("/{path:path}")
 def options_ok(path: str):
-    # CORS middleware will attach the Access-Control-* headers
     return PlainTextResponse("ok")
 
 # ==============================================================================
@@ -341,82 +338,77 @@ def _safe_head_rows(rows: List[List[Any]], n: int = 25) -> str:
         out.append(" | ".join((("" if v is None else str(v))[:80] for v in row)))
     return "\n".join(out)
 
-async def _extract_text_from_files(files: Optional[List[UploadFile]]) -> str:
-    """Best-effort text extraction without pandas. Truncates to avoid token blowups."""
-    if not files:
-        return ""
+async def _extract_text_from_files(files: List[UploadFile]) -> str:
+    """
+    Extract text from uploaded files. Never raises. Best-effort only.
+    Supports: txt, csv, pdf, docx, xlsx (if libs present). Falls back to filenames.
+    """
     chunks: List[str] = []
-    for f in files:
-        name = (f.filename or "file").strip()
-        lower = name.lower()
+    for f in files or []:
         try:
-            raw = await f.read()
+            name = (f.filename or "").lower()
+            data = await f.read()
+            await f.seek(0)
+            if not data:
+                continue
+
+            if name.endswith(".txt"):
+                chunks.append(data.decode("utf-8", errors="ignore"))
+
+            elif name.endswith(".csv"):
+                try:
+                    text = data.decode("utf-8", errors="ignore")
+                    reader = csv.reader(io.StringIO(text))
+                    rows = []
+                    for i, row in enumerate(reader):
+                        if i > 200: break
+                        rows.append(", ".join(row))
+                    chunks.append("\n".join(rows))
+                except Exception:
+                    chunks.append(name)
+
+            elif name.endswith(".pdf") and PdfReader:
+                try:
+                    reader = PdfReader(io.BytesIO(data))
+                    pages = []
+                    for i, p in enumerate(reader.pages):
+                        if i >= 10: break
+                        pages.append(p.extract_text() or "")
+                    chunks.append("\n".join(pages))
+                except Exception:
+                    chunks.append(name)
+
+            elif name.endswith(".docx") and docx:
+                try:
+                    d = docx.Document(io.BytesIO(data))
+                    chunks.append("\n".join([p.text for p in d.paragraphs if p.text]))
+                except Exception:
+                    chunks.append(name)
+
+            elif name.endswith(".xlsx") and openpyxl:
+                try:
+                    wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+                    ws = wb.active
+                    take = []
+                    for r_i, row in enumerate(ws.iter_rows(values_only=True)):
+                        if r_i > 200: break
+                        take.append(", ".join("" if v is None else str(v) for v in row))
+                    chunks.append("\n".join(take))
+                except Exception:
+                    chunks.append(name)
+
+            else:
+                # unknown or missing libs: fallback to file name only
+                chunks.append(name)
         except Exception:
+            # never bubble
             continue
 
-        if len(raw) > 3_000_000:
-            raw = raw[:3_000_000]
-
-        # PDF
-        if lower.endswith(".pdf") and PdfReader is not None:
-            try:
-                reader = PdfReader(io.BytesIO(raw))
-                pages = min(len(reader.pages), 10)
-                text = []
-                for i in range(pages):
-                    text.append(reader.pages[i].extract_text() or "")
-                chunks.append(f"\n\n# [PDF] {name}\n" + "\n".join(text))
-                continue
-            except Exception:
-                pass
-
-        # DOCX
-        if lower.endswith(".docx") and docx is not None:
-            try:
-                d = docx.Document(io.BytesIO(raw))
-                text = "\n".join([p.text for p in d.paragraphs if p.text.strip()])[:15000]
-                chunks.append(f"\n\n# [DOCX] {name}\n{text}")
-                continue
-            except Exception:
-                pass
-
-        # CSV
-        if lower.endswith(".csv"):
-            try:
-                text = raw.decode("utf-8", errors="ignore")
-                rows = list(csv.reader(io.StringIO(text)))
-                chunks.append(f"\n\n# [CSV] {name}\n" + _safe_head_rows(rows, 25))
-                continue
-            except Exception:
-                pass
-
-        # XLSX/XLS
-        if (lower.endswith(".xlsx") or lower.endswith(".xls")) and openpyxl is not None:
-            try:
-                wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-                sheetnames = wb.sheetnames[:3]
-                parts = [f"Sheets: {', '.join(sheetnames)}"]
-                for s in sheetnames:
-                    ws = wb[s]
-                    lines = []
-                    for r_i, row in enumerate(ws.iter_rows(min_row=1, max_row=25, values_only=True)):
-                        if r_i >= 25:
-                            break
-                        lines.append(" | ".join((("" if v is None else str(v))[:80] for v in row)))
-                    parts.append(f"\n### sheet: {s}\n" + "\n".join(lines))
-                chunks.append(f"\n\n# [XLSX] {name}\n" + "\n".join(parts))
-                continue
-            except Exception:
-                pass
-
-        # TXT / fallback
-        try:
-            txt = raw.decode("utf-8", errors="ignore")[:20000]
-            chunks.append(f"\n\n# [TEXT] {name}\n{txt}")
-        except Exception:
-            pass
-
-    return "\n".join(chunks).strip()
+    # clean and cap
+    text = "\n\n".join([c for c in chunks if c]).strip()
+    if len(text) > 16000:
+        text = text[:16000]
+    return text
 
 def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
     """
@@ -692,6 +684,135 @@ def debug_brains(doc: DocumentIn, db=Depends(get_db), current: User = Depends(ge
             out[name] = {"error": str(e)}
     return out
 
+@api.post("/analyze", response_model=AnalyzeResponse)
+async def api_analyze(
+    request: Request,
+    doc: Optional[DocumentIn] = None,
+    text: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
+    db=Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    """
+    Accepts multipart (Dashboard) or JSON. Never throws uncaught errors.
+    Ensures at least 1 recommendation per CXO and mirrors into details_by_role.
+    """
+    try:
+        # -------- Normalize input --------
+        content = ""
+        filename = None
+        tier = ("premium" if getattr(current, "is_admin", False)
+                else ("pro" if getattr(current, "is_paid", False) else "demo"))
+
+        ct = (request.headers.get("content-type") or "").lower()
+        is_multipart = "multipart/form-data" in ct or (text is not None) or (file is not None) or (files is not None)
+
+        if is_multipart:
+            file_list: List[UploadFile] = []
+            if file is not None:
+                file_list.append(file)
+            if files:
+                file_list.extend(files)
+            appendix = await _extract_text_from_files(file_list)
+            content = ((text or "") + (("\n\n" + appendix) if appendix else "")).strip()
+
+            for f in file_list:
+                if getattr(f, "filename", None):
+                    filename = f.filename
+                    break
+            if not filename:
+                filename = "input.txt"
+        else:
+            if doc is None:
+                try:
+                    body = await request.json()
+                except Exception:
+                    raise HTTPException(status_code=415, detail="Unsupported content-type. Send JSON or multipart/form-data.")
+                try:
+                    doc = DocumentIn(**(body or {}))
+                except Exception:
+                    raise HTTPException(status_code=422, detail="Invalid payload for DocumentIn.")
+            content = (doc.content or "").strip()
+            filename = doc.filename or "input.txt"
+            tier = (doc.tier or tier).lower()
+
+        if not content:
+            raise HTTPException(status_code=400, detail="No content provided for analysis.")
+
+        excerpt = content[:16000]
+
+        # -------- Run brains (never fail the request) --------
+        raw: List[Dict[str, Any]] = []
+        for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
+            fn = brain_registry.get(role)
+            if not fn:
+                continue
+            try:
+                out = fn({"document_excerpt": excerpt, "tier": tier}) or {}
+                if isinstance(out, dict) and not out.get("role"):
+                    out["role"] = role
+                raw.append(out)
+            except Exception as e:
+                raw.append({"role": role, "summary": "", "recommendations": [], "error": str(e)})
+
+        # -------- Aggregate (never fail the request) --------
+        combined: Dict[str, Any] = {}
+        try:
+            combined = aggregate_brain_outputs(raw, document_filename=filename) or {}
+        except Exception as e:
+            combined = {"overall_summary": "", "insights": [], "aggregate": {}, "details_by_role": {}, "error": str(e)}
+
+        # -------- Guarantees: at least one rec per role + mirror to details --------
+        agg = combined.get("aggregate") or {}
+        recs_by_role: Dict[str, List[str]] = dict(
+            (agg.get("recommendations_by_role") or agg.get("cxo_recommendations") or {})
+        )
+        for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
+            lst = list(recs_by_role.get(role) or [])
+            if not lst:
+                first = None
+                src = next((r for r in raw if (r.get("role") or "").upper() == role), None)
+                if src:
+                    arr = list(src.get("recommendations") or [])
+                    if arr:
+                        first = arr[0]
+                if not first:
+                    try:
+                        fb = _fallback_recs(role, excerpt)
+                        if fb:
+                            first = fb[0]
+                    except Exception:
+                        first = None
+                if first:
+                    recs_by_role[role] = [first]
+        agg["recommendations_by_role"] = recs_by_role
+        agg.setdefault("cxo_recommendations", recs_by_role)
+        combined["aggregate"] = agg
+
+        details = combined.setdefault("details_by_role", {})
+        for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
+            block = details.get(role) or {}
+            if not (block.get("recommendations") or []):
+                first = (recs_by_role.get(role) or [None])[0]
+                if first:
+                    block["recommendations"] = [first]
+                    details[role] = block
+        combined["details_by_role"] = details
+
+        # -------- Respond --------
+        job_id = str(uuid.uuid4())
+        _log_usage(db, current.id, "/api/analyze", "ok")
+        return AnalyzeResponse(job_id=job_id, combined=CombinedInsights(**combined))
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Last-resort safety: still return a valid shape
+        job_id = str(uuid.uuid4())
+        combined = {"overall_summary": "", "insights": [], "aggregate": {}, "details_by_role": {}, "error": str(e)}
+        _log_usage(db, current.id, "/api/analyze", "error", meta=str(e)[:200])
+        return AnalyzeResponse(job_id=job_id, combined=CombinedInsights(**combined))
 
 # ==============================================================================
 # Chat (sessions/history/send)
