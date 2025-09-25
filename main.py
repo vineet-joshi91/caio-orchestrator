@@ -526,6 +526,61 @@ async def _run_analyze_from_content(content: str, filename: str, tier: str) -> D
                     block["recommendations"] = [first]
                     details[role] = block
         combined["details_by_role"] = details
+        # --- Ensure Collective Insights (2–3 items) --------------------------
+        agg = combined.get("aggregate") or {}
+        collective = list(
+            agg.get("collective")
+            or agg.get("collective_insights")
+            or combined.get("collective_insights")
+            or []
+        )
+        
+        if not collective:
+            # Try to harvest from CombinedInsights.insights[] (role summaries)
+            try:
+                pool = []
+                for it in (combined.get("insights") or []):
+                    s = (it.get("summary") or "").strip()
+                    if s:
+                        pool.append(s)
+                collective = pool[:3]
+            except Exception:
+                pass
+        
+        if not collective:
+            # Split overall_summary into sentences
+            try:
+                txt = (combined.get("overall_summary") or "").strip()
+                if txt:
+                    parts = [p.strip() for p in txt.replace("\n", " ").split(".") if p.strip()]
+                    collective = parts[:3]
+            except Exception:
+                pass
+        
+        if not collective:
+            # Fall back to first recs across roles, labeled
+            try:
+                tmp = []
+                recs_by_role = (
+                    agg.get("recommendations_by_role")
+                    or agg.get("cxo_recommendations")
+                    or {}
+                )
+                for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
+                    first = (recs_by_role.get(role) or [None])[0]
+                    if first:
+                        tmp.append(f"{role}: {first}")
+                    if len(tmp) >= 3:
+                        break
+                collective = tmp
+            except Exception:
+                pass
+        
+        # Final write-back in both canonical spots the FE may read
+        agg["collective"] = collective
+        agg["collective_insights"] = collective
+        combined["aggregate"] = agg
+        combined["collective_insights"] = collective
 
         if DEBUG_VERBOSE:
             combined.setdefault("debug", {})["dbg"] = dbg
