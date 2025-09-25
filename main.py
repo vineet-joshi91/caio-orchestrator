@@ -7,7 +7,7 @@ CAIO Orchestrator Backend
  - Health/Ready
 """
 
-import os, re
+import os
 import io
 import csv
 import json
@@ -79,61 +79,23 @@ from brains.registry import brain_registry
 # App & CORS
 # ==============================================================================
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
-# Avoid 307/308 redirect that can omit CORS headers
-app.router.redirect_slashes = False
 
-from starlette.middleware.cors import CORSMiddleware
-from starlette.responses import PlainTextResponse
-import os, re
+allowed = settings.ALLOWED_ORIGINS_LIST
+if not allowed and getattr(settings, "DEBUG", False):
+    allowed = ["*"]
 
-# 1) Load and normalize allowed origins
-allowed = getattr(settings, "ALLOWED_ORIGINS_LIST", None)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
 
-# If it’s a comma-separated string, split it. If None, use defaults.
-if isinstance(allowed, str):
-    allowed = [o.strip() for o in allowed.split(",") if o.strip()]
-elif isinstance(allowed, (tuple, set)):
-    allowed = list(allowed)
-elif not isinstance(allowed, list) or not allowed:
-    allowed = [
-        "https://caio-frontend.vercel.app",
-        "http://localhost:3000",
-        "https://caioai.netlify.app",
-    ]
-
-# 2) Optional preview domains (Vercel/Netlify)
-allow_origin_regex = r"^https://([a-z0-9-]+\.)?(vercel\.app|netlify\.app)$"
-
-# 3) Debug “allow all” (avoid '*' with credentials=True)
-debug_mode = bool(getattr(settings, "DEBUG", False) or not getattr(settings, "PRODUCTION", True))
-if debug_mode:
-    # In debug, allow any origin without credentials
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[],                 # none explicit
-        allow_origin_regex=r".*",         # allow all origins
-        allow_credentials=False,          # cannot combine '*' with credentials
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["*"],
-        expose_headers=["Content-Disposition"],
-        max_age=86400,
-    )
-else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allowed,            # explicit prod list
-        allow_origin_regex=allow_origin_regex,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With", "Origin", "User-Agent", "Cache-Control", "Pragma", "*"],
-        expose_headers=["Content-Disposition"],
-        max_age=86400,
-    )
-
-# Always 200 for preflight (covers any path)
 @app.options("/{path:path}")
 def options_ok(path: str):
     return PlainTextResponse("ok")
+
 
 # ==============================================================================
 # Startup warmup (DB)
@@ -208,9 +170,9 @@ def _caps_for_tier(tier: str) -> Dict[str, int]:
                 "uploads_per_day": _iget("UPLOADS_PER_DAY_PAID", 50),
                 "max_extract_chars": _iget("MAX_EXTRACT_CHARS_PRO", 12000),
                 "max_file_mb": _iget("MAX_FILE_MB_PRO", 15)}
-    if t in ("premium", "admin"):
-        return {"analyze_per_day": None,
-                "chat_msgs_per_day": None,
+    if t == "premium":
+        return {"analyze_per_day": _iget("PRO_QUERIES_PER_DAY", 50),
+                "chat_msgs_per_day": _iget("PREMIUM_MSGS_PER_DAY", 50),
                 "uploads_per_day": _iget("UPLOADS_PER_DAY_PAID", 50),
                 "max_extract_chars": _iget("MAX_EXTRACT_CHARS_PRO", 12000),
                 "max_file_mb": _iget("MAX_FILE_MB_PRO", 15)}
@@ -267,7 +229,7 @@ def version():
     return {"version": settings.VERSION}
 
 # Fallback ready (in case health router isn't mounted)
-@app.get("/ready")
+@app.get("/api/ready")
 def api_ready():
     return {"ok": True, "db": DB_READY, "startup": STARTUP_OK}
 
@@ -545,16 +507,16 @@ def _fallback_recs(role: str, text: str) -> List[str]:
         ]
     return recs
 
-
-# ---------- Core analyze logic (shared by JSON & multipart) ----------
-def _analyze_core(doc: DocumentIn, db, current: User):
+@api.post("/analyze", response_model=AnalyzeResponse)
+def api_analyze(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get_current_user)):
     """
-    Core pipeline: caps, run brains, aggregate, build combined payload (with details_by_role).
+    Run brains + aggregator. If aggregator or brains return nothing,
+    synthesize meaningful fallbacks so FE always renders content.
     """
-    tier = (doc.tier or getattr(current, "plan_tier", None) or ("pro" if getattr(current, "is_paid", False) else "demo")).lower()
+    tier = (doc.tier or getattr(current, "plan_tier", None) or ("pro" if current.is_paid else "demo")).lower()
     caps = _caps_for_tier(tier)
 
-    # daily cap (unlimited when limit is None)
+    # daily cap
     start, end = _today_bounds_utc()
     used = db.query(UsageLog).filter(
         UsageLog.user_id == current.id,
@@ -562,16 +524,16 @@ def _analyze_core(doc: DocumentIn, db, current: User):
         UsageLog.timestamp >= start,
         UsageLog.timestamp < end,
     ).count()
-    limit = caps.get("analyze_per_day") if isinstance(caps, dict) else getattr(caps, "analyze_per_day", None)
-    if isinstance(limit, int) and limit >= 0 and used >= limit:
+    if used >= caps["analyze_per_day"]:
         raise HTTPException(status_code=429, detail=f"Daily analyze cap reached for tier '{tier}'")
 
     excerpt = (doc.content or "")[:caps["max_extract_chars"]]
 
     # ---- run brains ----
-    raw_brain_outputs = []
-    insights = []
+    raw_brain_outputs: List[Dict[str, Any]] = []
+    insights: List[Insight] = []
     roles = ("CFO", "CHRO", "COO", "CMO", "CPO")
+
     for brain_name in roles:
         fn = brain_registry.get(brain_name)
         if not fn:
@@ -579,24 +541,22 @@ def _analyze_core(doc: DocumentIn, db, current: User):
         out = fn({"document_excerpt": excerpt, "tier": tier}) or {}
         role = (out.get("role") or brain_name).upper()
 
+        # Defensive: if brain returned an error-like string
         raw_text_error = ""
         if isinstance(out, str) and out.startswith("[OPENROUTER"):
             raw_text_error = out
 
         topline = (out.get("topline_insight") or out.get("summary") or raw_text_error or "").strip()
         recs = list(out.get("recommendations") or [])
+
+        # Fallback per role if empty
         if not recs:
             recs = _fallback_recs(role, excerpt)
 
-        raw_brain_outputs.append({
-            "role": role,
-            "topline_insight": topline,
-            "recommendations": recs,
-            "raw": out.get("raw"),
-        })
+        raw_brain_outputs.append({"role": role, "topline_insight": topline, "recommendations": recs})
         insights.append(Insight(role=role, summary=topline, recommendations=recs))
 
-    # ---- aggregate (tier-capped summary lists) ----
+    # ---- aggregate ----
     agg = aggregate_brain_outputs(raw_brain_outputs, tier=tier) or {}
     collective = list(agg.get("collective") or agg.get("collective_insights") or [])
     recs_by_role = dict(agg.get("recommendations_by_role") or {})
@@ -607,26 +567,6 @@ def _analyze_core(doc: DocumentIn, db, current: User):
     if not recs_by_role:
         recs_by_role = {r["role"]: list(r.get("recommendations") or []) for r in raw_brain_outputs}
 
-    # Ensure at least one recommendation per role
-    role_order = ("CFO", "CHRO", "COO", "CMO", "CPO")
-    for role_name in role_order:
-        recs_list = recs_by_role.get(role_name) or []
-        if not recs_list:
-            raw = next((r for r in raw_brain_outputs if (r.get("role") or "").upper() == role_name), None)
-            first = None
-            if raw:
-                arr = list(raw.get("recommendations") or [])
-                if arr:
-                    first = arr[0]
-            if not first:
-                try:
-                    fb = _fallback_recs(role_name, excerpt)
-                    first = fb[0] if fb else None
-                except Exception:
-                    first = None
-            if first:
-                recs_by_role[role_name] = [first]
-
     combined = CombinedInsights(
         document_filename=doc.filename,
         overall_summary="Combined insights across CXO brains.",
@@ -634,87 +574,18 @@ def _analyze_core(doc: DocumentIn, db, current: User):
     )
     combined_dict = combined.model_dump() if hasattr(combined, "model_dump") else combined.dict()
     combined_dict["aggregate"] = {
-        "collective": collective,
-        "collective_insights": collective,
-        "recommendations_by_role": recs_by_role,
-        "cxo_recommendations": recs_by_role,
+    "collective": collective,
+    "collective_insights": collective,            # NEW mirror
+    "recommendations_by_role": recs_by_role,
+    "cxo_recommendations": recs_by_role,          # NEW mirror
     }
-
-    # Full, uncapped details per role (Premium/Admin)
-    details_by_role = {}
-    for r in raw_brain_outputs:
-        role_key = (r.get("role") or "").upper()
-        if not role_key:
-            continue
-        details_by_role[role_key] = {
-            "summary": r.get("topline_insight") or None,
-            "recommendations": list(r.get("recommendations") or []),
-            "raw": r.get("raw") or None,
-        }
-
-    # Mirror: ensure details_by_role has at least one recommendation
-    for role_name in role_order:
-        block = details_by_role.get(role_name) or {}
-        arr = list(block.get("recommendations") or [])
-        if not arr:
-            agg_first = (recs_by_role.get(role_name) or [None])[0]
-            if agg_first:
-                block["recommendations"] = [agg_first]
-                details_by_role[role_name] = block
-
-    combined_dict["details_by_role"] = details_by_role
 
     _log_usage(db, current.id, "/api/analyze", meta=f"tier={tier}")
     job_id = str(uuid.uuid4())
     return {"job_id": job_id, "combined": combined_dict}
 
 
-@api.post("/analyze", response_model=AnalyzeResponse)
-async def api_analyze(request: Request, db=Depends(get_db), current: User = Depends(get_current_user)):
-    """
-    Accepts JSON (DocumentIn) or multipart/form-data with fields:
-      - text: optional
-      - file/files: uploads (PDF/DOCX/TXT/CSV/XLSX)
-    """
-    ct = (request.headers.get("content-type") or "").lower()
-
-    if "multipart/form-data" in ct:
-        form = await request.form()
-        text = (form.get("text") or "").strip()
-        files = []
-        try:
-            items_iter = form.multi_items()
-        except Exception:
-            items_iter = form.items()
-        for key, val in items_iter:
-            if key in ("file", "files") and hasattr(val, "filename"):
-                files.append(val)
-        appendix = await _extract_text_from_files(files)
-        combined_text = (text + (("\n\n" + appendix) if appendix else "")).strip()
-        first_name = None
-        for f in files:
-            if getattr(f, "filename", None):
-                first_name = f.filename
-                break
-        tier_for_analysis = (getattr(current, "plan_tier", None) or ("pro" if getattr(current, "is_paid", False) else "demo")).lower()
-        doc = DocumentIn(
-            content=combined_text or text or "",
-            filename=first_name or (text and "prompt.txt") or "input.txt",
-            tier=tier_for_analysis,
-        )
-        return _analyze_core(doc, db, current)
-
-    # JSON path
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=415, detail="Unsupported content-type. Send JSON or multipart/form-data.")
-    try:
-        doc = DocumentIn(**(body or {}))
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid payload for DocumentIn.")
-    return _analyze_core(doc, db, current)
-
+# (Optional) Admin-only debug endpoint
 @api.post("/debug/brains")
 def debug_brains(doc: DocumentIn, db=Depends(get_db), current: User = Depends(get_current_user)):
     """Returns each brain's raw dict for quick troubleshooting (admin only)."""
@@ -844,7 +715,6 @@ async def chat_send(
 
     # 4) DIRECT analyze call (no internal HTTP)
     tier_for_analysis = "premium" if getattr(current, "is_admin", False) else ("pro" if getattr(current, "is_paid", False) else "demo")
-    analysis_dict: Dict[str, Any] = {}
     try:
         doc = DocumentIn(content=combined_text, filename=(filenames[0] if filenames else None), tier=tier_for_analysis)
         analysis = api_analyze(doc=doc, db=db, current=current)
@@ -927,7 +797,7 @@ async def chat_send(
 # ==============================================================================
 # Mount routers
 # ==============================================================================
-app.include_router(api, prefix="/api")
+app.include_router(api)
 if health_router:         app.include_router(health_router)
 if admin_router:          app.include_router(admin_router)
 if admin_metrics_router:  app.include_router(admin_metrics_router)
