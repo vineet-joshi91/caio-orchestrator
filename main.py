@@ -101,7 +101,7 @@ allow_origin_regex = (
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed,
-    allow_origin_regex=allow_origin_regex,   # safety net
+    allow_origin_regex=allow_origin_regex,  # belt & suspenders
     allow_credentials=True,
     allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
     allow_headers=["*"],
@@ -322,6 +322,17 @@ def api_whoami(current: User = Depends(get_current_user)):
         tier = "premium"
     return {"email": current.email, "tier": tier, "is_admin": is_admin}
 
+@api.get("/_echo/ready")
+def echo_ready(request: Request):
+    return {"ok": True, "origin": request.headers.get("origin")}
+
+@api.post("/analyze/echo")
+async def analyze_echo(request: Request):
+    return {
+        "ok": True,
+        "content_type": request.headers.get("content-type"),
+        "has_auth": bool(request.headers.get("authorization")),
+    }
 
 # ==============================================================================
 # Brains + Analyze
@@ -520,147 +531,145 @@ from typing import Optional, List, Dict, Any
 from fastapi import Request, Form, File, UploadFile, HTTPException, Depends
 
 # --- /api/analyze that accepts multipart + JSON, and guarantees data completeness ---
-@api.post(
-    "/analyze",
-    response_model=AnalyzeResponse,
-    openapi_extra={  # <- so /openapi.json shows multipart (helps you verify deploy)
-        "requestBody": {
-            "content": {
-                "application/json": {
-                    "schema": {"$ref": "#/components/schemas/DocumentIn"}
-                },
-                "multipart/form-data": {
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "text": {"type": "string"},
-                            "file": {"type": "string", "format": "binary"},
-                            "files": {
-                                "type": "array",
-                                "items": {"type": "string", "format": "binary"},
-                            },
-                        },
-                    }
-                },
-            }
-        }
-    },
-)
+import traceback
+
+DEBUG_VERBOSE = bool(os.getenv("DEBUG_VERBOSE", "0") == "1")
+
+@api.post("/analyze", response_model=AnalyzeResponse)
 async def api_analyze(
     request: Request,
-    # JSON body (optional)
+    # JSON path
     doc: Optional[DocumentIn] = None,
-    # Multipart fields (Dashboard)
+    # multipart path
     text: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = File(None),
     db=Depends(get_db),
     current: User = Depends(get_current_user),
 ):
-    """
-    Accepts either multipart (Dashboard) or JSON (legacy clients) and returns AnalyzeResponse.
-    Ensures at least one recommendation per CXO in both aggregate and details_by_role.
-    """
-    # ---------------- Normalize input ----------------
-    is_multipart = "multipart/form-data" in (request.headers.get("content-type") or "").lower()
+    dbg: Dict[str, Any] = {"phase": "start"}
 
-    content = ""
-    filename = None
-    tier = ("premium" if getattr(current, "is_admin", False)
-            else ("pro" if getattr(current, "is_paid", False) else "demo"))
+    try:
+        # --- Normalize input ---
+        ct = (request.headers.get("content-type") or "").lower()
+        is_multipart = "multipart/form-data" in ct or (text is not None) or (file is not None) or (files is not None)
 
-    if is_multipart or (text is not None) or (file is not None) or (files is not None):
-        file_list: List[UploadFile] = []
-        if file is not None:
-            file_list.append(file)
-        if files:
-            file_list.extend(files)
+        tier = ("premium" if getattr(current, "is_admin", False)
+                else ("pro" if getattr(current, "is_paid", False) else "demo"))
 
-        appendix = await _extract_text_from_files(file_list)
-        content = ((text or "") + (("\n\n" + appendix) if appendix else "")).strip()
+        content = ""
+        filename = "input.txt"
 
-        for f in file_list:
-            if getattr(f, "filename", None):
-                filename = f.filename
-                break
-        if not filename:
-            filename = "prompt.txt" if (text or "") else "input.txt"
-    else:
-        if doc is None:
+        if is_multipart:
+            flist: List[UploadFile] = []
+            if file is not None: flist.append(file)
+            if files: flist.extend(files)
+            dbg["files"] = [getattr(f, "filename", None) for f in flist]
+
+            # best-effort extraction; never raises
+            appendix = await _extract_text_from_files(flist)
+            content = ((text or "") + (("\n\n" + appendix) if appendix else "")).strip()
+            for f in flist:
+                if getattr(f, "filename", None):
+                    filename = f.filename
+                    break
+        else:
+            if doc is None:
+                try:
+                    body = await request.json()
+                except Exception:
+                    raise HTTPException(status_code=415, detail="Unsupported content-type. Send JSON or multipart/form-data.")
+                try:
+                    doc = DocumentIn(**(body or {}))
+                except Exception:
+                    raise HTTPException(status_code=422, detail="Invalid payload for DocumentIn.")
+            content = (doc.content or "").strip()
+            filename = doc.filename or "input.txt"
+            tier = (doc.tier or tier).lower()
+
+        if not content:
+            raise HTTPException(status_code=400, detail="No content provided for analysis.")
+
+        excerpt = content[:16000]
+        dbg.update({"phase": "brains", "tier": tier, "filename": filename})
+
+        # --- Run brains (do not fail request) ---
+        raw: List[Dict[str, Any]] = []
+        for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
+            fn = brain_registry.get(role)
+            if not fn:
+                continue
             try:
-                body = await request.json()
-            except Exception:
-                raise HTTPException(status_code=415, detail="Unsupported content-type. Send JSON or multipart/form-data.")
-            try:
-                doc = DocumentIn(**(body or {}))
-            except Exception:
-                raise HTTPException(status_code=422, detail="Invalid payload for DocumentIn.")
-        content = (doc.content or "").strip()
-        filename = doc.filename or "input.txt"
-        tier = (doc.tier or tier).lower()
+                out = fn({"document_excerpt": excerpt, "tier": tier}) or {}
+                if isinstance(out, dict) and not out.get("role"):
+                    out["role"] = role
+                raw.append(out)
+            except Exception as e:
+                raw.append({"role": role, "summary": "", "recommendations": [], "error": str(e)})
 
-    if not content:
-        raise HTTPException(status_code=400, detail="No content provided for analysis.")
+        dbg["phase"] = "aggregate"
 
-    excerpt = content[:16000]
-
-    # ---------------- Run brains ----------------
-    raw_brain_outputs: List[Dict[str, Any]] = []
-    for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
-        fn = brain_registry.get(role)
-        if not fn:
-            continue
+        # --- Aggregate (do not fail request) ---
         try:
-            out = fn({"document_excerpt": excerpt, "tier": tier}) or {}
-            if isinstance(out, dict) and not out.get("role"):
-                out["role"] = role
-            raw_brain_outputs.append(out)
+            combined: Dict[str, Any] = aggregate_brain_outputs(raw, document_filename=filename) or {}
         except Exception as e:
-            raw_brain_outputs.append({"role": role, "summary": "", "recommendations": [], "error": str(e)})
+            combined = {"overall_summary": "", "insights": [], "aggregate": {}, "details_by_role": {}, "error": str(e)}
+            if DEBUG_VERBOSE:
+                combined["debug"] = {"aggregate_error": str(e), "trace": traceback.format_exc()}
 
-    # ---------------- Aggregate ----------------
-    combined: Dict[str, Any] = aggregate_brain_outputs(raw_brain_outputs, document_filename=filename) or {}
-    agg = combined.get("aggregate") or {}
-    recs_by_role: Dict[str, List[str]] = dict(
-        (agg.get("recommendations_by_role") or agg.get("cxo_recommendations") or {})
-    )
+        # --- Guarantees: one rec per role + mirror into details ---
+        agg = combined.get("aggregate") or {}
+        recs_by_role: Dict[str, List[str]] = dict(
+            (agg.get("recommendations_by_role") or agg.get("cxo_recommendations") or {})
+        )
+        for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
+            lst = list(recs_by_role.get(role) or [])
+            if not lst:
+                first = None
+                src = next((r for r in raw if (r.get("role") or "").upper() == role), None)
+                if src:
+                    arr = list(src.get("recommendations") or [])
+                    if arr:
+                        first = arr[0]
+                if not first:
+                    try:
+                        fb = _fallback_recs(role, excerpt)
+                        if fb: first = fb[0]
+                    except Exception:
+                        pass
+                if first:
+                    recs_by_role[role] = [first]
+        agg["recommendations_by_role"] = recs_by_role
+        agg.setdefault("cxo_recommendations", recs_by_role)
+        combined["aggregate"] = agg
 
-    # ---------------- Guarantee at least 1 rec per role ----------------
-    for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
-        lst = list(recs_by_role.get(role) or [])
-        if not lst:
-            raw = next((r for r in raw_brain_outputs if (r.get("role") or "").upper() == role), None)
-            first = None
-            if raw:
-                arr = list(raw.get("recommendations") or [])
-                if arr:
-                    first = arr[0]
-            if not first:
-                fb = _fallback_recs(role, excerpt)
-                if fb:
-                    first = fb[0]
-            if first:
-                recs_by_role[role] = [first]
+        details = combined.setdefault("details_by_role", {})
+        for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
+            block = details.get(role) or {}
+            if not (block.get("recommendations") or []):
+                first = (recs_by_role.get(role) or [None])[0]
+                if first:
+                    block["recommendations"] = [first]
+                    details[role] = block
+        combined["details_by_role"] = details
 
-    agg["recommendations_by_role"] = recs_by_role
-    agg.setdefault("cxo_recommendations", recs_by_role)
-    combined["aggregate"] = agg
+        if DEBUG_VERBOSE:
+            combined.setdefault("debug", {})["dbg"] = dbg
 
-    # Ensure details_by_role mirrors a first rec (so Premium/Admin details never empty)
-    details = combined.setdefault("details_by_role", {})
-    for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
-        block = details.get(role) or {}
-        if not (block.get("recommendations") or []):
-            first = (recs_by_role.get(role) or [None])[0]
-            if first:
-                block["recommendations"] = [first]
-                details[role] = block
-    combined["details_by_role"] = details
+        # --- Respond ---
+        job_id = str(uuid.uuid4())
+        _log_usage(db, current.id, "/api/analyze", "ok")
+        return AnalyzeResponse(job_id=job_id, combined=CombinedInsights(**combined))
 
-    # ---------------- Respond ----------------
-    job_id = str(uuid.uuid4())
-    _log_usage(db, current.id, "/api/analyze", "ok")
-    return AnalyzeResponse(job_id=job_id, combined=CombinedInsights(**combined))
+    except HTTPException:
+        raise
+    except Exception as e:
+        job_id = str(uuid.uuid4())
+        payload = {"overall_summary": "", "insights": [], "aggregate": {}, "details_by_role": {}}
+        if DEBUG_VERBOSE:
+            payload["debug"] = {"fatal": str(e), "trace": traceback.format_exc(), "dbg": dbg}
+        _log_usage(db, current.id, "/api/analyze", "error", meta=str(e)[:200])
+        return AnalyzeResponse(job_id=job_id, combined=CombinedInsights(**payload))
 
 # (Optional) Admin-only debug endpoint
 @api.post("/debug/brains")
