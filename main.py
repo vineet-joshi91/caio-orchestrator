@@ -76,36 +76,37 @@ from brains.registry import brain_registry
 
 
 # ==============================================================================
-# App & CORS  (hardened)
+# App & CORS  (ironclad)
 # ==============================================================================
-def _parse_allowed_origins(val) -> List[str]:
-    """
-    Accept list/tuple/set OR comma-separated string from env/settings.
-    Returns a clean list of origins.
-    """
-    if isinstance(val, (list, tuple, set)):
-        return [str(x).strip() for x in val if str(x).strip()]
-    if isinstance(val, str):
-        # Split comma-separated env like: "https://a.com, http://localhost:3000"
-        parts = [p.strip() for p in val.split(",") if p.strip()]
-        return parts
-    return []
+import os
+from typing import List
 
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
 
-allowed = _parse_allowed_origins(getattr(settings, "ALLOWED_ORIGINS_LIST", None))
-if not allowed:
-    # fallback to env var if settings is empty
-    allowed = _parse_allowed_origins(os.getenv("ALLOWED_ORIGINS", ""))
+def _parse_origins(val) -> List[str]:
+    if isinstance(val, (list, tuple, set)):
+        return [str(x).strip() for x in val if str(x).strip()]
+    if isinstance(val, str):
+        # split comma-separated, trim each
+        return [p.strip() for p in val.split(",") if p.strip()]
+    return []
 
-# As an additional safety net, allow common hostnames via regex if list is empty.
-allow_origin_regex = None
+# 1) Read from settings first, then env
+allowed = _parse_origins(getattr(settings, "ALLOWED_ORIGINS_LIST", None))
 if not allowed:
-    allow_origin_regex = r"^https://([a-zA-Z0-9-]+\.)?vercel\.app$|^http://localhost:3000$|^https://([a-zA-Z0-9-]+\.)?netlify\.app$"
+    allowed = _parse_origins(os.getenv("ALLOWED_ORIGINS", ""))
+
+# 2) A precise, safe regex that always matches your three origins (belt & suspenders)
+#    This guarantees matching even if 'allowed' accidentally becomes a bad value.
+allow_origin_regex = (
+    r"^(https://caio-frontend\.vercel\.app"
+    r"|http://localhost:3000"
+    r"|https://caioai\.netlify\.app)$"
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed if allowed else [],
+    allow_origins=allowed,            # will be [] if parsing fails — that's OK because regex covers
     allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -115,9 +116,8 @@ app.add_middleware(
 
 @app.options("/{path:path}")
 def options_ok(path: str):
-    # CORS middleware attaches the Access-Control-* headers
+    # CORS middleware will attach the Access-Control-* headers
     return PlainTextResponse("ok")
-
 
 # ==============================================================================
 # Startup warmup (DB)
