@@ -87,7 +87,7 @@ from starlette.responses import PlainTextResponse
 import os, re
 
 # 1) Load and normalize allowed origins
-allowed = getattr(settings, "ALLOWED_ORIGINS_LIST", None)
+allowed = getattr(settings, "ALLOWED_ORIGINS", None)
 
 # If it’s a comma-separated string, split it. If None, use defaults.
 if isinstance(allowed, str):
@@ -110,7 +110,7 @@ if debug_mode:
     # In debug, allow any origin without credentials
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[],                 # none explicit
+        allow_origins=allowed,                 # none explicit
         allow_origin_regex=r".*",         # allow all origins
         allow_credentials=False,          # cannot combine '*' with credentials
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
