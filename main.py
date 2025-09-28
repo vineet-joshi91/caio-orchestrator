@@ -230,53 +230,69 @@ api = APIRouter(prefix="/api", tags=["api"])
 def api_public_config():
     return _public_config_from_env()
 
+from fastapi.responses import JSONResponse
+
 @api.post("/signup")
-async def api_signup(request: Request, db=Depends(get_db)):
-    email = password = None
+def api_signup(body: AuthLogin, db=Depends(get_db)):
     try:
-        body = await request.json()
-        if isinstance(body, dict):
-            email = (body.get("email") or "").strip().lower()
-            password = body.get("password")
-    except Exception:
-        pass
-    if (not email or not password) and request.headers.get("content-type", "").lower().startswith("application/x-www-form-urlencoded"):
-        form = await request.form()
-        email = (form.get("email") or "").strip().lower()
-        password = form.get("password")
+        email = (body.email or "").strip().lower()
+        password = body.password or ""
+        if not email or not password:
+            raise HTTPException(status_code=400, detail="Email and password are required")
 
-    if not email or not password:
-        raise HTTPException(status_code=400, detail="Email and password are required")
+        # Is this user already present?
+        user = db.query(User).filter(User.email.ilike(email)).first()
+        if user and user.hashed_password:
+            # Existing normal user
+            raise HTTPException(status_code=400, detail="User already exists")
 
-    exists = db.query(User).filter(User.email == email).first()
-    if exists:
-        raise HTTPException(status_code=400, detail="User already exists")
+        # Create or update (idempotent)
+        if not user:
+            user = User(
+                email=email,
+                tier="demo",
+                is_admin=False,
+                is_paid=False,
+                created_at=datetime.utcnow(),
+                last_seen=datetime.utcnow(),
+            )
+            db.add(user)
 
-    u = User(email=email, hashed_password=get_password_hash(password),
-             is_admin=False, is_paid=False, created_at=datetime.utcnow(), last_seen=datetime.utcnow())
-    db.add(u); db.commit()
-    return {"ok": True, "message": "Signup successful. Please log in."}
+        # set/replace password
+        user.hashed_password = get_password_hash(password)
+        db.commit()
+
+        return {"ok": True, "message": "Signup successful. Please log in."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # TEMP: self-diagnose the 500 cause so we don't have to guess
+        return JSONResponse(status_code=500, content={"detail": "internal_error", "error": str(e)})
+
 
 @api.post("/login", response_model=AuthToken)
 def api_login(body: AuthLogin, db=Depends(get_db)):
-    # Normalize inputs
-    email = (body.email or "").strip().lower()
-    password = body.password or ""
+    try:
+        email = (body.email or "").strip().lower()
+        password = body.password or ""
 
-    # Lookup (case-insensitive)
-    user = db.query(User).filter(User.email.ilike(email)).first()
+        user = db.query(User).filter(User.email.ilike(email)).first()
+        if not user or not user.hashed_password or not verify_password(password, user.hashed_password):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    # Validate credentials
-    if not user or not user.hashed_password or not verify_password(password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        _touch_user_last_seen(db, user.id)
 
-    # Bump activity (non-fatal on failure)
-    _touch_user_last_seen(db, user.id)
+        # IMPORTANT: do NOT pass expires_delta (some auth.py versions don't accept it)
+        token = create_access_token(sub=user.email)
 
-    # Issue JWT (uses default expiry from auth.py settings)
-    token = create_access_token(sub=user.email)
+        return AuthToken(access_token=token)
 
-    return AuthToken(access_token=token)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # TEMP: surface the error text so we know exactly what's wrong
+        return JSONResponse(status_code=500, content={"detail": "internal_error", "error": str(e)})
 
 
 @api.get("/profile", response_model=Me)
