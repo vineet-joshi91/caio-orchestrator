@@ -66,17 +66,12 @@ def verify_password(password: str, hashed: Optional[str]) -> bool:
         return False
 
 def create_access_token(sub: str, *, expires_in: Optional[int] = None, expires_delta=None) -> str:
-    """
-    Create a signed JWT with subject = user's email (lowercased).
-    Accepts either `expires_in` seconds or a `timedelta` via `expires_delta` (for compatibility).
-    """
     now = int(time.time())
     if expires_delta is not None:
         exp_secs = int(getattr(expires_delta, "total_seconds", lambda: JWT_EXPIRE_SECONDS)())
     else:
         exp_secs = int(expires_in if expires_in is not None else JWT_EXPIRE_SECONDS)
     payload = {"sub": (sub or "").lower(), "iat": now, "exp": now + exp_secs}
-    # PyJWT and jose share the same encode/decode call shapes for HS256
     return _pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
 def _decode_token(token: str) -> dict:
