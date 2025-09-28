@@ -20,3 +20,4 @@ reportlab
 razorpay==1.4.2
 setuptools>=69
 pydantic-settings==2.6.1
+PyJWT==2.8.0
