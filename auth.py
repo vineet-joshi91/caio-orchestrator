@@ -3,8 +3,28 @@ import os
 import time
 from typing import Optional, Set
 
-import bcrypt
-import jwt  # PyJWT
+# --- JWT backend: PyJWT preferred; fall back to python-jose if available ---
+try:
+    import jwt as _pyjwt  # PyJWT
+    _JWT_BACKEND = "pyjwt"
+except Exception:
+    try:
+        from jose import jwt as _pyjwt  # python-jose
+        _JWT_BACKEND = "jose"
+    except Exception as e:
+        raise ImportError(
+            "No JWT library found. Install PyJWT (`pip install PyJWT`) "
+            "or python-jose (`pip install python-jose`)."
+        ) from e
+
+# --- Password hashing ---
+try:
+    import bcrypt
+except Exception as e:
+    raise ImportError(
+        "bcrypt is not installed. Add `bcrypt` to requirements.txt."
+    ) from e
+
 from fastapi import Depends, Header, Cookie, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -16,13 +36,13 @@ from db import get_db, User
 # ------------------------------------------------------------------------------
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-in-prod")
 JWT_ALGO = os.getenv("JWT_ALGO", "HS256")
-JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", "604800"))  # default 7 days
+JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", "604800"))  # 7 days
 
 # Comma-separated admin emails (case-insensitive)
 _admin_emails_env = os.getenv("ADMIN_EMAILS", "")
 ADMIN_EMAILS: Set[str] = {e.strip().lower() for e in _admin_emails_env.split(",") if e.strip()}
 
-# Optional: treat an entire email domain as admin (e.g., "yourcompany.com")
+# Optional: treat a whole domain as admin (e.g., "yourco.com")
 ADMIN_DOMAIN = os.getenv("ADMIN_DOMAIN", "").strip().lower()
 
 # ------------------------------------------------------------------------------
@@ -33,6 +53,10 @@ def hash_password(password: str) -> str:
         raise ValueError("Empty password not allowed")
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
+# keep backward-compat with main.py import
+def get_password_hash(password: str) -> str:
+    return hash_password(password)
+
 def verify_password(password: str, hashed: Optional[str]) -> bool:
     if not password or not hashed:
         return False
@@ -41,16 +65,24 @@ def verify_password(password: str, hashed: Optional[str]) -> bool:
     except Exception:
         return False
 
-def create_access_token(sub: str, *, expires_in: Optional[int] = None) -> str:
-    """Create a signed JWT with subject = user's email (lowercased)."""
+def create_access_token(sub: str, *, expires_in: Optional[int] = None, expires_delta=None) -> str:
+    """
+    Create a signed JWT with subject = user's email (lowercased).
+    Accepts either `expires_in` seconds or a `timedelta` via `expires_delta` (for compatibility).
+    """
     now = int(time.time())
-    exp_secs = int(expires_in if expires_in is not None else JWT_EXPIRE_SECONDS)
+    if expires_delta is not None:
+        exp_secs = int(getattr(expires_delta, "total_seconds", lambda: JWT_EXPIRE_SECONDS)())
+    else:
+        exp_secs = int(expires_in if expires_in is not None else JWT_EXPIRE_SECONDS)
     payload = {"sub": (sub or "").lower(), "iat": now, "exp": now + exp_secs}
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+    # PyJWT and jose share the same encode/decode call shapes for HS256
+    return _pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
 def _decode_token(token: str) -> dict:
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        # For PyJWT, returns dict; for jose, returns dict too
+        return _pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
@@ -76,7 +108,7 @@ def _ensure_allowlisted_flag(db: Session, user: User) -> None:
         if not user.is_admin and _is_allowlisted_admin(user.email):
             db.execute(text("UPDATE users SET is_admin = TRUE WHERE id = :uid"), {"uid": user.id})
             db.commit()
-            user.is_admin = True  # reflect change on the in-memory instance
+            user.is_admin = True
     except Exception:
         db.rollback()
 
@@ -84,16 +116,12 @@ def _ensure_allowlisted_flag(db: Session, user: User) -> None:
 # Token extraction
 # ------------------------------------------------------------------------------
 def _extract_bearer_token(authorization: Optional[str], cookie_token: Optional[str]) -> str:
-    # Priority 1: Authorization header ("Bearer <token>")
     if authorization:
         parts = authorization.split()
         if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1].strip():
             return parts[1].strip()
-
-    # Priority 2: Cookie named "token" (best effort; ensure you set it securely if you use it)
     if cookie_token and cookie_token.strip():
         return cookie_token.strip()
-
     raise HTTPException(status_code=401, detail="Missing token")
 
 # ------------------------------------------------------------------------------
@@ -104,10 +132,6 @@ def get_current_user(
     authorization: Optional[str] = Header(default=None, convert_underscores=False),
     token_cookie: Optional[str] = Cookie(default=None, alias="token"),
 ) -> User:
-    """
-    Resolve the current user from a JWT Bearer token (or 'token' cookie).
-    Returns a fully-loaded ORM User. Raises 401 if missing/invalid, 404 if not found.
-    """
     token = _extract_bearer_token(authorization, token_cookie)
     payload = _decode_token(token)
     email = (payload.get("sub") or "").strip().lower()
@@ -116,18 +140,12 @@ def get_current_user(
 
     user: Optional[User] = db.query(User).filter(User.email.ilike(email)).first()
     if not user:
-        # Token valid but user missing -> treat as revoked / stale
         raise HTTPException(status_code=401, detail="User not found")
 
-    # If allowlisted via env, ensure DB flag is set
     _ensure_allowlisted_flag(db, user)
     return user
 
 def require_admin(user: User = Depends(get_current_user)) -> User:
-    """
-    Admin-only guard. Accepts either DB-flagged admin OR allowlisted email/domain.
-    Auto-flips DB flag for allowlisted admins.
-    """
     if bool(user.is_admin) or _is_allowlisted_admin(user.email):
         return user
     raise HTTPException(status_code=403, detail="Admin only")
@@ -136,7 +154,6 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
 # Optional convenience: authenticate via email+password inside endpoints
 # ------------------------------------------------------------------------------
 def authenticate_user(db: Session, email: str, password: str) -> Optional[User]:
-    """Return user if credentials are valid; otherwise None."""
     e = (email or "").strip().lower()
     if not e or not password:
         return None
