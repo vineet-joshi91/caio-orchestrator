@@ -259,15 +259,25 @@ async def api_signup(request: Request, db=Depends(get_db)):
 
 @api.post("/login", response_model=AuthToken)
 def api_login(body: AuthLogin, db=Depends(get_db)):
-    user = db.query(User).filter(User.email == (body.email or "").lower()).first()
-    if not user or not verify_password(body.password or "", user.hashed_password):
+    # Normalize inputs
+    email = (body.email or "").strip().lower()
+    password = body.password or ""
+
+    # Lookup (case-insensitive)
+    user = db.query(User).filter(User.email.ilike(email)).first()
+
+    # Validate credentials
+    if not user or not user.hashed_password or not verify_password(password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    # bump last_seen on successful login (non-fatal if it fails)
+
+    # Bump activity (non-fatal on failure)
     _touch_user_last_seen(db, user.id)
-    token = create_access_token(
-        sub=user.email, expires_delta=timedelta(minutes=getattr(settings, "JWT_EXPIRE_MINUTES", 120))
-    )
+
+    # Issue JWT (uses default expiry from auth.py settings)
+    token = create_access_token(sub=user.email)
+
     return AuthToken(access_token=token)
+
 
 @api.get("/profile", response_model=Me)
 def api_profile(current: User = Depends(get_current_user), db=Depends(get_db)):
