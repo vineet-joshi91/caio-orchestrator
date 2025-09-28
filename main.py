@@ -4,6 +4,7 @@ CAIO Orchestrator Backend
  - Auth, Profile, Public Config
  - Analyze (brains + aggregator) with safe fallbacks
  - Premium Chat (sessioned) returning Markdown (no FE change needed)
+ - Admin users roster & summary (added)
  - Health/Ready
 """
 
@@ -23,6 +24,8 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
+from pydantic import BaseModel  # (added) for small admin response models
+from sqlalchemy import text      # (added) for tiny updates/queries
 
 # Optional parsers (used if available; code is resilient if missing)
 try:
@@ -49,6 +52,8 @@ from caio_core.aggregation.brain_aggregator import aggregate_brain_outputs
 # --- DB & auth (your modules) ---
 from db import get_db, init_db, User, UsageLog, ChatSession, ChatMessage
 from auth import get_current_user, create_access_token, get_password_hash, verify_password
+# NOTE: We deliberately do NOT import require_admin to avoid coupling;
+# we gate admin endpoints by checking current.is_admin inline to preserve compatibility.
 
 # --- Feature routers (optional) ---
 try:
@@ -150,8 +155,17 @@ async def _startup():
 # ==============================================================================
 def _log_usage(db, user_id: int, endpoint: str, status_text="ok", meta: str = ""):
     try:
+        # keep your existing UsageLog schema behavior
         db.add(UsageLog(user_id=user_id, endpoint=endpoint, status=status_text,
                         tokens_used=0, timestamp=datetime.utcnow(), meta=meta))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+def _touch_user_last_seen(db, user_id: int):
+    """Light-touch bump of last_seen, non-fatal on errors."""
+    try:
+        db.execute(text("UPDATE users SET last_seen = NOW() WHERE id = :uid"), {"uid": user_id})
         db.commit()
     except Exception:
         db.rollback()
@@ -182,9 +196,9 @@ def _public_config_from_env() -> Dict[str, Any]:
         "pro_plus":{"analyze": int(os.getenv("PRO_QUERIES_PER_DAY", 50)),
                     "chat":    int(os.getenv("PRO_PLUS_MSGS_PER_DAY", 25)),
                     "uploads": int(os.getenv("UPLOADS_PER_DAY_PAID", 50))},
-        "premium":{"analyze": int(os.getenv("PRO_QUERIES_PER_DAY", 50)),
-                   "chat":    int(os.getenv("PREMIUM_MSGS_PER_DAY", 50)),
-                   "uploads": int(os.getenv("UPLOADS_PER_DAY_PAID", 50))}
+        "premium":{"analyze": int(os.getenv("PRO_QUERIES_PER_DAY", None)),
+                   "chat":    int(os.getenv("PREMIUM_MSGS_PER_DAY", None)),
+                   "uploads": int(os.getenv("UPLOADS_PER_DAY_PAID", None))}
     }
     return {
         "appName": settings.APP_NAME,
@@ -239,7 +253,7 @@ async def api_signup(request: Request, db=Depends(get_db)):
         raise HTTPException(status_code=400, detail="User already exists")
 
     u = User(email=email, hashed_password=get_password_hash(password),
-             is_admin=False, is_paid=False, created_at=datetime.utcnow())
+             is_admin=False, is_paid=False, created_at=datetime.utcnow(), last_seen=datetime.utcnow())
     db.add(u); db.commit()
     return {"ok": True, "message": "Signup successful. Please log in."}
 
@@ -248,13 +262,17 @@ def api_login(body: AuthLogin, db=Depends(get_db)):
     user = db.query(User).filter(User.email == (body.email or "").lower()).first()
     if not user or not verify_password(body.password or "", user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    # bump last_seen on successful login (non-fatal if it fails)
+    _touch_user_last_seen(db, user.id)
     token = create_access_token(
         sub=user.email, expires_delta=timedelta(minutes=getattr(settings, "JWT_EXPIRE_MINUTES", 120))
     )
     return AuthToken(access_token=token)
 
 @api.get("/profile", response_model=Me)
-def api_profile(current: User = Depends(get_current_user)):
+def api_profile(current: User = Depends(get_current_user), db=Depends(get_db)):
+    # bump last_seen whenever profile is fetched
+    _touch_user_last_seen(db, current.id)
     tier_val = (getattr(current, "plan_tier", None) or ("pro" if getattr(current, "is_paid", False) else "demo"))
     if getattr(current, "is_admin", False):
         tier_val = "premium"
@@ -288,8 +306,8 @@ async def _extract_text_from_files(files: List[UploadFile]) -> str:
 
             elif name.endswith(".csv"):
                 try:
-                    text = data.decode("utf-8", errors="ignore")
-                    reader = csv.reader(io.StringIO(text))
+                    text_csv = data.decode("utf-8", errors="ignore")
+                    reader = csv.reader(io.StringIO(text_csv))
                     rows = []
                     for i, row in enumerate(reader):
                         if i > 200: break
@@ -369,7 +387,7 @@ def _fallback_recs(role: str, text: str) -> List[str]:
         ]
     elif role == "CPO":
         recs += [
-            "Define 3 outcomes; align product bets with owners and metrics.",
+            "Define 3 outcomes; align people roles with job metrics.",
             "Weekly discovery cadence; 5 user interviews per cycle.",
         ]
     return recs
@@ -526,6 +544,7 @@ async def _run_analyze_from_content(content: str, filename: str, tier: str) -> D
                     block["recommendations"] = [first]
                     details[role] = block
         combined["details_by_role"] = details
+
         # --- Ensure Collective Insights (2–3 items) --------------------------
         agg = combined.get("aggregate") or {}
         collective = list(
@@ -534,7 +553,6 @@ async def _run_analyze_from_content(content: str, filename: str, tier: str) -> D
             or combined.get("collective_insights")
             or []
         )
-        
         if not collective:
             # Try to harvest from CombinedInsights.insights[] (role summaries)
             try:
@@ -546,7 +564,6 @@ async def _run_analyze_from_content(content: str, filename: str, tier: str) -> D
                 collective = pool[:3]
             except Exception:
                 pass
-        
         if not collective:
             # Split overall_summary into sentences
             try:
@@ -556,7 +573,6 @@ async def _run_analyze_from_content(content: str, filename: str, tier: str) -> D
                     collective = parts[:3]
             except Exception:
                 pass
-        
         if not collective:
             # Fall back to first recs across roles, labeled
             try:
@@ -575,7 +591,7 @@ async def _run_analyze_from_content(content: str, filename: str, tier: str) -> D
                 collective = tmp
             except Exception:
                 pass
-        
+
         # Final write-back in both canonical spots the FE may read
         agg["collective"] = collective
         agg["collective_insights"] = collective
@@ -649,6 +665,7 @@ async def api_analyze(
         raise HTTPException(status_code=400, detail="No content provided for analysis.")
 
     result = await _run_analyze_from_content(content, filename, tier)
+    _touch_user_last_seen(db, current.id)  # bump activity
     _log_usage(db, current.id, "/api/analyze", "ok")
     return JSONResponse(result, status_code=200)
 
@@ -658,6 +675,7 @@ async def api_analyze(
 # ==============================================================================
 @api.get("/chat/sessions")
 def chat_sessions_list(db=Depends(get_db), current: User = Depends(get_current_user)):
+    _touch_user_last_seen(db, current.id)
     rows = (
         db.query(ChatSession)
         .filter(ChatSession.user_id == current.id)
@@ -668,6 +686,7 @@ def chat_sessions_list(db=Depends(get_db), current: User = Depends(get_current_u
 
 @api.post("/chat/sessions")
 def chat_sessions_create(body: Dict[str, Any] = None, db=Depends(get_db), current: User = Depends(get_current_user)):
+    _touch_user_last_seen(db, current.id)
     title = None
     if body and isinstance(body, dict):
         title = (body.get("title") or "").strip() or None
@@ -677,6 +696,7 @@ def chat_sessions_create(body: Dict[str, Any] = None, db=Depends(get_db), curren
 
 @api.get("/chat/history")
 def chat_history_get(session_id: int = Query(..., ge=1), db=Depends(get_db), current: User = Depends(get_current_user)):
+    _touch_user_last_seen(db, current.id)
     sess = db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == current.id).first()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -685,6 +705,7 @@ def chat_history_get(session_id: int = Query(..., ge=1), db=Depends(get_db), cur
 
 @api.post("/chat/history")
 def chat_history_append(body: Dict[str, Any], db=Depends(get_db), current: User = Depends(get_current_user)):
+    _touch_user_last_seen(db, current.id)
     session_id = int(body.get("session_id") or 0)
     role = (body.get("role") or "").strip() or "user"
     content = (body.get("content") or "").strip()
@@ -709,6 +730,8 @@ async def chat_send(
     Accepts multipart (message + files), extracts text, runs analyze core directly,
     stores user + assistant messages, and returns **Markdown** (and raw JSON) for FE.
     """
+    _touch_user_last_seen(db, current.id)
+
     # 1) ensure/create session
     if session_id:
         sess = (
@@ -823,6 +846,134 @@ async def chat_send(
             "created_at": am.created_at.isoformat() + "Z",
         },
     }
+
+
+# ==============================================================================
+# Admin: Users roster & summary (added; gated by current.is_admin)
+# ==============================================================================
+class AdminUserOut(BaseModel):
+    id: int
+    email: str
+    username: Optional[str] = None
+    tier: str
+    is_admin: bool
+    is_test: bool
+    is_paid: bool
+    created_on: Optional[str] = None
+    last_seen: Optional[str] = None
+    total_sessions: int
+
+class AdminUsersOut(BaseModel):
+    items: List[AdminUserOut]
+    page: int
+    page_size: int
+    total: int
+    counters: Dict[str, int]
+
+@api.get("/admin/users", response_model=AdminUsersOut)
+def admin_users(
+    q: str = Query("", description="search by email/username"),
+    page: int = 1,
+    page_size: int = 25,
+    include_test: bool = False,
+    include_admins: bool = True,
+    db=Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    if not bool(getattr(current, "is_admin", False)):
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    q = (q or "").strip().lower()
+    offset = max(0, (page - 1) * page_size)
+
+    filters = ["1=1"]
+    params = {"limit": page_size, "offset": offset}
+    if q:
+        filters.append("(lower(u.email) LIKE :qq OR lower(u.username) LIKE :qq)")
+        params["qq"] = f"%{q}%"
+    if not include_test:
+        filters.append("COALESCE(u.is_test,false) = FALSE")
+    if not include_admins:
+        filters.append("COALESCE(u.is_admin,false) = FALSE")
+
+    where = " AND ".join(filters)
+    profile_select = """
+      SELECT u.id, u.email, u.username, COALESCE(u.tier,'demo') AS tier,
+             COALESCE(u.is_admin,false) AS is_admin,
+             COALESCE(u.is_test,false)  AS is_test,
+             COALESCE(u.is_paid,false)  AS is_paid,
+             u.created_at, u.last_seen,
+             COALESCE(s.sessions,0) AS total_sessions
+      FROM users u
+      LEFT JOIN (
+        SELECT user_id, COUNT(*)::int AS sessions
+        FROM chat_sessions
+        GROUP BY user_id
+      ) s ON s.user_id = u.id
+    """
+
+    rows = db.execute(text(f"""
+      {profile_select}
+      WHERE {where}
+      ORDER BY u.last_seen DESC NULLS LAST, u.created_at DESC
+      LIMIT :limit OFFSET :offset
+    """), params).mappings().all()
+
+    count_row = db.execute(text(f"""
+      SELECT COUNT(*) AS c FROM users u
+      WHERE {where}
+    """), params).mappings().first()
+
+    counts = db.execute(text("""
+      SELECT
+        COUNT(*) FILTER (WHERE is_test = FALSE AND COALESCE(is_admin,false)=FALSE) AS real_users,
+        COUNT(*) FILTER (WHERE is_test = TRUE)  AS test_users,
+        COUNT(*) FILTER (WHERE is_admin = TRUE) AS admins,
+        COUNT(*) FILTER (WHERE tier='demo')     AS demo,
+        COUNT(*) FILTER (WHERE tier='pro')      AS pro,
+        COUNT(*) FILTER (WHERE tier IN ('pro+','pro_plus')) AS pro_plus,
+        COUNT(*) FILTER (WHERE tier='premium')  AS premium
+      FROM users
+    """)).mappings().one()
+
+    def map_row(r):
+        return {
+            "id": r["id"],
+            "email": r["email"],
+            "username": r.get("username"),
+            "tier": r.get("tier"),
+            "is_admin": bool(r.get("is_admin")),
+            "is_test": bool(r.get("is_test")),
+            "is_paid": bool(r.get("is_paid")),
+            "created_on": r["created_at"].isoformat() + "Z" if r.get("created_at") else None,
+            "last_seen":  r["last_seen"].isoformat() + "Z" if r.get("last_seen") else None,
+            "total_sessions": int(r.get("total_sessions") or 0),
+        }
+
+    return {
+        "items": [map_row(r) for r in rows],
+        "page": page,
+        "page_size": page_size,
+        "total": int(count_row["c"] if count_row else 0),
+        "counters": {k: int(v) for k, v in dict(counts).items()} if counts else {},
+    }
+
+@api.get("/admin/users/summary")
+def admin_users_summary(db=Depends(get_db), current: User = Depends(get_current_user)):
+    if not bool(getattr(current, "is_admin", False)):
+        raise HTTPException(status_code=403, detail="Admin only")
+    row = db.execute(text("""
+      SELECT
+        COUNT(*) FILTER (WHERE is_test = FALSE AND COALESCE(is_admin,false)=FALSE) AS real_users,
+        COUNT(*) FILTER (WHERE is_test = TRUE)  AS test_users,
+        COUNT(*) FILTER (WHERE is_admin = TRUE) AS admins,
+        COUNT(*) FILTER (WHERE tier='demo')     AS demo,
+        COUNT(*) FILTER (WHERE tier='pro')      AS pro,
+        COUNT(*) FILTER (WHERE tier IN ('pro+','pro_plus')) AS pro_plus,
+        COUNT(*) FILTER (WHERE tier='premium')  AS premium
+      FROM users
+    """)).mappings().one()
+    return {k: int(v) for k, v in dict(row).items()}
 
 
 # ==============================================================================

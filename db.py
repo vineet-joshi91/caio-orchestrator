@@ -1,44 +1,81 @@
 # db.py
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, ForeignKey, text
-from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session, relationship
+from typing import Generator, Optional
 
-# ---------- connection & fallback ----------
+from sqlalchemy import (
+    create_engine,
+    Column, Integer, String, Boolean, DateTime, Text,
+    ForeignKey, text
+)
+from sqlalchemy.orm import (
+    sessionmaker, declarative_base, scoped_session, relationship, Session
+)
+
+# ------------------------------------------------------------------------------
+# Connection (fail-fast in prod, optional sqlite only if you explicitly allow it)
+# ------------------------------------------------------------------------------
 def _normalize_db_url(url: str) -> str:
     return url.replace("postgres://", "postgresql://", 1) if url.startswith("postgres://") else url
 
-PRIMARY_URL = _normalize_db_url(os.getenv("DATABASE_URL", "").strip())
-FALLBACK_TO_SQLITE = os.getenv("DB_FALLBACK_TO_SQLITE", "1").lower() in ("1", "true", "yes")
-PG_CONNECT_TIMEOUT = int(os.getenv("PG_CONNECT_TIMEOUT", "5"))
-SQLITE_URL = "sqlite:///./caio.db"
+DATABASE_URL = _normalize_db_url((os.getenv("DATABASE_URL") or "").strip())
+DB_FALLBACK_TO_SQLITE = (os.getenv("DB_FALLBACK_TO_SQLITE", "0").lower() in ("1", "true", "yes"))
+SQLITE_URL = "sqlite:///./caio.dev.sqlite3"
+
+if not DATABASE_URL:
+    if DB_FALLBACK_TO_SQLITE:
+        DATABASE_URL = SQLITE_URL
+    else:
+        # Fail fast if prod URL missing; prevents writing to a random local DB.
+        raise RuntimeError("DATABASE_URL not set. Set DB_FALLBACK_TO_SQLITE=1 only for local dev.")
 
 def _make_engine(url: str):
     url = _normalize_db_url(url)
-    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {"connect_timeout": PG_CONNECT_TIMEOUT}
+    if url.startswith("sqlite"):
+        connect_args = {"check_same_thread": False}
+    else:
+        # keep a small connect timeout so failures surface quickly
+        connect_args = {"connect_timeout": int(os.getenv("PG_CONNECT_TIMEOUT", "5"))}
     return create_engine(url, pool_pre_ping=True, pool_recycle=300, future=True, connect_args=connect_args)
 
-engine = _make_engine(PRIMARY_URL or SQLITE_URL)
+engine = _make_engine(DATABASE_URL)
 SessionLocal = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 
-# ---------- models ----------
+# ------------------------------------------------------------------------------
+# ORM Models
+# ------------------------------------------------------------------------------
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String(255), unique=True, index=True, nullable=False)
+
+    # Auth
     hashed_password = Column(String(255), nullable=True)
-    is_admin = Column(Boolean, default=False, nullable=False)
-    is_paid = Column(Boolean, default=False, nullable=False)
-    created_at = Column(DateTime, nullable=True)
+
+    # Identity / plan
+    username = Column(String(255), nullable=True)
+    tier = Column(String(32), nullable=False, default="demo")          # demo | pro | pro_plus | premium | admin (label)
+    is_admin = Column(Boolean, nullable=False, default=False)
+    is_test = Column(Boolean, nullable=False, default=False)           # mark internal/testing accounts
+    is_paid = Column(Boolean, nullable=False, default=False)
+
+    # Optional future billing fields (kept nullable; won't break if absent in DB)
+    billing_currency = Column(String(8), nullable=True)                # "INR" | "USD" | None
+    plan_tier = Column(String(32), nullable=True)                      # "pro" | "pro_plus" | "premium" | None
+    plan_status = Column(String(32), nullable=True)                    # "active" | "cancelled" | etc.
+
+    # Timestamps
+    created_at = Column(DateTime, nullable=True)                       # we’ll set NOW() at insert
+    last_seen = Column(DateTime, nullable=True)
 
 class UsageLog(Base):
     __tablename__ = "usage_logs"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, index=True, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
-    endpoint = Column(String, default="analyze", index=True)
-    status = Column(String, default="ok")
+    endpoint = Column(String(64), default="analyze", index=True)
+    status = Column(String(32), default="ok")                          # "ok" | "429" | "error" ...
     meta = Column(String, default="")
 
 class ChatSession(Base):
@@ -58,28 +95,43 @@ class ChatMessage(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     session = relationship("ChatSession", back_populates="messages")
 
-# ---------- init & session ----------
-def init_db():
-    global engine, SessionLocal
-    target = PRIMARY_URL or SQLITE_URL
-    try:
-        probe = _make_engine(target)
-        with probe.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        engine = probe
-        SessionLocal.remove()
-        SessionLocal.configure(bind=engine)
-    except Exception:
-        if not FALLBACK_TO_SQLITE or target.startswith("sqlite"):
-            raise
-        engine = _make_engine(SQLITE_URL)
-        SessionLocal.remove()
-        SessionLocal.configure(bind=engine)
+# ------------------------------------------------------------------------------
+# Init & session helpers
+# ------------------------------------------------------------------------------
+def init_db() -> None:
+    """Initialize the DB connection and create tables if missing."""
+    # Probe connectivity first; fail early if Neon is unreachable.
+    with _make_engine(DATABASE_URL).connect() as conn:
+        conn.execute(text("SELECT 1"))
+    # Bind the proven engine and create tables (no destructive migrations).
+    global engine
+    engine = _make_engine(DATABASE_URL)
+    SessionLocal.remove()
+    SessionLocal.configure(bind=engine)
     Base.metadata.create_all(bind=engine)
 
-def get_db():
-    db = SessionLocal()
+def get_db() -> Generator[Session, None, None]:
+    db: Session = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+# ------------------------------------------------------------------------------
+# Small utility helpers used by routes (optional but handy)
+# ------------------------------------------------------------------------------
+def touch_last_seen(db: Session, user_id: int) -> None:
+    """Update last_seen = NOW() for a user; ignore failures to avoid breaking flow."""
+    try:
+        db.execute(text("UPDATE users SET last_seen = NOW() WHERE id = :uid"), {"uid": user_id})
+        db.commit()
+    except Exception:
+        db.rollback()
+
+def log_usage(db: Session, *, user_id: Optional[int], endpoint: str, status: str = "ok", meta: str = "") -> None:
+    """Insert a usage log row; safe-and-silent on failure."""
+    try:
+        db.add(UsageLog(user_id=user_id or 0, endpoint=endpoint[:64], status=status[:32], meta=meta[:1000]))
+        db.commit()
+    except Exception:
+        db.rollback()
