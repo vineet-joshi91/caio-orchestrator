@@ -50,7 +50,7 @@ from caio_core.schemas import (
 from caio_core.aggregation.brain_aggregator import aggregate_brain_outputs
 
 # --- DB & auth (your modules) ---
-from db import get_db, init_db, User, UsageLog, ChatSession, ChatMessage
+from db import get_db, init_db, User, UsageLog, ChatSession, ChatMessage, log_usage
 from auth import get_current_user, create_access_token, get_password_hash, verify_password
 # NOTE: We deliberately do NOT import require_admin to avoid coupling;
 # we gate admin endpoints by checking current.is_admin inline to preserve compatibility.
@@ -240,7 +240,7 @@ def api_public_config():
 from fastapi.responses import JSONResponse
 
 @api.post("/signup")
-def api_signup(body: AuthLogin, db=Depends(get_db)):
+def api_signup(body: AuthLogin, request: Request, db=Depends(get_db)):
     try:
         email = (body.email or "").strip().lower()
         password = body.password or ""
@@ -268,39 +268,105 @@ def api_signup(body: AuthLogin, db=Depends(get_db)):
         # set/replace password
         user.hashed_password = get_password_hash(password)
         db.commit()
+        db.refresh(user)
+
+        # ✅ record signup success in Neon
+        ip, ua = _client_meta(request)
+        db.execute(
+            text("SELECT public.log_auth_event(:email, 'signup', TRUE, :ip, :ua)"),
+            {"email": user.email, "ip": ip, "ua": ua},
+        )
+        db.commit()
+
+        # optional usage log (ignore failures)
+        try:
+            _log_usage(db, user_id=int(user.id), endpoint="/api/signup", status_text="ok")
+        except Exception:
+            db.rollback()
 
         return {"ok": True, "message": "Signup successful. Please log in."}
 
-    except HTTPException:
+    except HTTPException as e:
+        # record failed signup attempt (by email) and re-raise
+        try:
+            ip, ua = _client_meta(request)
+            db.execute(
+                text("SELECT public.log_auth_event(:email, 'signup', FALSE, :ip, :ua)"),
+                {"email": (body.email or "").strip().lower(), "ip": ip, "ua": ua},
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
         raise
     except Exception as e:
-        # TEMP: self-diagnose the 500 cause so we don't have to guess
+        # record failure but keep returning 500 like before
+        try:
+            ip, ua = _client_meta(request)
+            db.execute(
+                text("SELECT public.log_auth_event(:email, 'signup', FALSE, :ip, :ua)"),
+                {"email": (body.email or "").strip().lower(), "ip": ip, "ua": ua},
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
         return JSONResponse(status_code=500, content={"detail": "internal_error", "error": str(e)})
 
-
 @api.post("/login", response_model=AuthToken)
-def api_login(body: AuthLogin, db=Depends(get_db)):
+def api_login(body: AuthLogin, request: Request, db=Depends(get_db)):
     try:
         email = (body.email or "").strip().lower()
         password = body.password or ""
 
         user = db.query(User).filter(User.email.ilike(email)).first()
         if not user or not user.hashed_password or not verify_password(password, user.hashed_password):
+            # record failed login
+            try:
+                ip, ua = _client_meta(request)
+                db.execute(
+                    text("SELECT public.log_auth_event(:email, 'login', FALSE, :ip, :ua)"),
+                    {"email": email, "ip": ip, "ua": ua},
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
+        # touch activity
         _touch_user_last_seen(db, user.id)
 
-        # IMPORTANT: do NOT pass expires_delta (some auth.py versions don't accept it)
+        # create token (keep your existing call style)
         token = create_access_token(sub=user.email)
+
+        # ✅ record successful login
+        ip, ua = _client_meta(request)
+        db.execute(
+            text("SELECT public.log_auth_event(:email, 'login', TRUE, :ip, :ua)"),
+            {"email": user.email, "ip": ip, "ua": ua},
+        )
+        db.commit()
+
+        # optional usage log (ignore failures)
+        try:
+            _log_usage(db, user_id=int(user.id), endpoint="/api/login", status_text="ok")
+        except Exception:
+            db.rollback()
 
         return AuthToken(access_token=token)
 
     except HTTPException:
         raise
     except Exception as e:
-        # TEMP: surface the error text so we know exactly what's wrong
+        # record as failed login for observability
+        try:
+            ip, ua = _client_meta(request)
+            db.execute(
+                text("SELECT public.log_auth_event(:email, 'login', FALSE, :ip, :ua)"),
+                {"email": (body.email or "").strip().lower(), "ip": ip, "ua": ua},
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
         return JSONResponse(status_code=500, content={"detail": "internal_error", "error": str(e)})
-
 
 @api.get("/profile", response_model=Me)
 def api_profile(current: User = Depends(get_current_user), db=Depends(get_db)):
@@ -332,6 +398,14 @@ def db_debug(db=Depends(get_db)):
 # ==============================================================================
 # Extraction helpers + formatter
 # ==============================================================================
+def _client_meta(request: Request):
+    """Return (ip, user_agent) respecting proxy headers."""
+    ip = request.headers.get("x-forwarded-for") or (request.client.host if request.client else None)
+    if ip and "," in ip:  # if multiple proxies, take first hop
+        ip = ip.split(",", 1)[0].strip()
+    ua = request.headers.get("user-agent")
+    return ip, ua
+
 async def _extract_text_from_files(files: List[UploadFile]) -> str:
     """
     Extract text from uploaded files. Never raises. Best-effort only.
