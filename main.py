@@ -65,10 +65,6 @@ try:
 except Exception:
     admin_router = None
 try:
-    from admin_metrics import router as admin_metrics_router
-except Exception:
-    admin_metrics_router = None
-try:
     from payment import router as payments_router
 except Exception:
     payments_router = None
@@ -84,43 +80,46 @@ from brains.registry import brain_registry
 # ==============================================================================
 # App & CORS  (stable)
 # ==============================================================================
+import re
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
 
-def _parse_origins(val):
-    if isinstance(val, (list, tuple, set)):
-        return [str(x).strip() for x in val if str(x).strip()]
-    if isinstance(val, str):
-        return [p.strip() for p in val.split(",") if p.strip()]
-    return []
+# explicit allowlist for your frontend origins
+ALLOWED_ORIGINS = [
+    "https://caio-frontend.vercel.app",
+    "http://localhost:3000",
+    # add any real FE domains you use:
+    # "https://caioinsights.com",
+    # "https://www.caioinsights.com",
+]
 
-allowed = _parse_origins(getattr(settings, "ALLOWED_ORIGINS_LIST", None))
-if not allowed:
-    allowed = _parse_origins(os.getenv("ALLOWED_ORIGINS", ""))
-
-allow_origin_regex = (
-    r"^("
-    r"https://([a-z0-9-]+\.)?vercel\.app"   # prod + preview Vercel
-    r"|http://localhost:3000"               # local dev
-    r"|https://caioinsights\.com"           # if you use this
-    r"|https://www\.caioinsights\.com"
-    r")$"
-)
+# also allow Vercel preview URLs by regex
+ALLOW_ORIGIN_REGEX = r"^https://([a-z0-9-]+\.)?vercel\.app$"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],            # leave empty when using regex
-    allow_origin_regex=allow_origin_regex,
+    allow_origins=ALLOWED_ORIGINS,     # explicit list
+    allow_origin_regex=ALLOW_ORIGIN_REGEX,  # plus previews
     allow_credentials=True,
     allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
 
+# Ensure error responses (401/404/500) also carry CORS headers
+@app.middleware("http")
+async def _always_add_cors(request, call_next):
+    resp = await call_next(request)
+    origin = request.headers.get("origin")
+    if origin and (origin in ALLOWED_ORIGINS or re.match(ALLOW_ORIGIN_REGEX, origin)):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        vary = resp.headers.get("Vary", "")
+        resp.headers["Vary"] = ("Origin" if not vary else (vary + ", Origin"))
+    return resp
 
 @app.options("/{path:path}")
 def options_ok(path: str):
     return PlainTextResponse("ok")
-
 
 # ==============================================================================
 # Startup warmup (DB)
@@ -1114,6 +1113,12 @@ def admin_users_summary(db=Depends(get_db), current: User = Depends(get_current_
     """)).mappings().one()
     return {k: int(v) for k, v in dict(row).items()}
 
+# --- Feature routers (optional) ---
+try:
+    from admin_metrics import router as admin_metrics_router
+except Exception as e:
+    admin_metrics_router = None
+    print("WARNING: admin_metrics NOT loaded:", repr(e))
 
 # ==============================================================================
 # Mount routers
