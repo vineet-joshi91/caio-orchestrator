@@ -20,7 +20,7 @@ from typing import Optional, List, Dict, Any, Tuple
 
 from fastapi import (
     FastAPI, APIRouter, Depends, HTTPException, Request, Query,
-    UploadFile, File, Form
+    UploadFile, File, Form, Response
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -404,6 +404,13 @@ def db_debug(db=Depends(get_db)):
     users = db.execute(text("SELECT count(*) FROM public.users")).scalar()
     latest = db.execute(text("SELECT max(timestamp) FROM public.usage_logs")).scalar()
     return {"info": dict(row), "counts": {"users": users, "usage_logs_latest": str(latest)}}
+
+from auth import clear_auth_cookie
+
+@api.post("/logout")
+def api_logout(response: Response):
+    clear_auth_cookie(response)
+    return JSONResponse({"ok": True})
 
 # ==============================================================================
 # Extraction helpers + formatter
