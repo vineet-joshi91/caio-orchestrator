@@ -105,22 +105,34 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# Ensure error responses (401/404/500) also carry CORS headers
-@app.middleware("http")
-async def _always_add_cors(request, call_next):
-    resp = await call_next(request)
-    origin = request.headers.get("origin")
-    if origin and (origin in ALLOWED_ORIGINS or re.match(ALLOW_ORIGIN_REGEX, origin)):
+def _set_cors_headers(resp: JSONResponse, origin: str | None):
+    if not origin:
+        return
+    if origin in ALLOWED_ORIGINS or re.match(ALLOW_ORIGIN_REGEX, origin):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         vary = resp.headers.get("Vary", "")
-        resp.headers["Vary"] = ("Origin" if not vary else (vary + ", Origin"))
+        resp.headers["Vary"] = "Origin" if not vary else f"{vary}, Origin"
+
+@app.middleware("http")
+async def _cors_on_all(request, call_next):
+    try:
+        resp = await call_next(request)
+    except Exception as e:
+        # convert crashes to JSON so the browser shows details instead of CORS block
+        resp = JSONResponse(
+            status_code=500,
+            content={"detail": "internal_server_error", "error": str(e)},
+        )
+    _set_cors_headers(resp, request.headers.get("origin"))
     return resp
 
 @app.options("/{path:path}")
 def options_ok(path: str):
-    return PlainTextResponse("ok")
-
+    resp = JSONResponse({"ok": True})
+    # make preflight succeed
+    _set_cors_headers(resp, None)  # browser ignores on OPTIONS without Origin
+    return resp
 # ==============================================================================
 # Startup warmup (DB)
 # ==============================================================================
