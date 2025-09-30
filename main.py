@@ -369,13 +369,10 @@ def api_login(body: AuthLogin, request: Request, db=Depends(get_db)):
     # --- 6) return token AND set cookie so browser sends it automatically ---
     resp = JSONResponse({"access_token": token})
     try:
-        # if you imported set_auth_cookie from auth.py
         from auth import set_auth_cookie
         set_auth_cookie(resp, token)
     except Exception:
-        # fall back silently if cookie utility missing
         pass
-
     return resp
 
 @api.get("/profile", response_model=Me)
@@ -405,11 +402,17 @@ def db_debug(db=Depends(get_db)):
     latest = db.execute(text("SELECT max(timestamp) FROM public.usage_logs")).scalar()
     return {"info": dict(row), "counts": {"users": users, "usage_logs_latest": str(latest)}}
 
-from auth import clear_auth_cookie
+#from auth import clear_auth_cookie
 
 @api.post("/logout")
 def api_logout(response: Response):
-    clear_auth_cookie(response)
+    # import lazily so app boot never crashes if auth helpers change
+    try:
+        from auth import clear_auth_cookie
+        clear_auth_cookie(response)
+    except Exception:
+        # swallow: logout should never take the app down
+        pass
     return JSONResponse({"ok": True})
 
 # ==============================================================================
