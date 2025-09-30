@@ -97,25 +97,25 @@ allowed = _parse_origins(getattr(settings, "ALLOWED_ORIGINS_LIST", None))
 if not allowed:
     allowed = _parse_origins(os.getenv("ALLOWED_ORIGINS", ""))
 
-# Regex belt & suspenders for the three origins you showed in Render
 allow_origin_regex = (
-    r"^(https://caio-frontend\.vercel\.app"
-    r"|http://localhost:3000"
-    r"|https://caioai\.netlify\.app"
-    r"|https://caioinsights\.com"
-    r"|https://www\.caioinsights\.com)$"
+    r"^("
+    r"https://([a-z0-9-]+\.)?vercel\.app"   # prod + preview Vercel
+    r"|http://localhost:3000"               # local dev
+    r"|https://caioinsights\.com"           # if you use this
+    r"|https://www\.caioinsights\.com"
+    r")$"
 )
-
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed,
+    allow_origins=[],            # leave empty when using regex
     allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
 
 @app.options("/{path:path}")
 def options_ok(path: str):
@@ -321,60 +321,62 @@ def api_signup(body: AuthLogin, request: Request, db=Depends(get_db)):
 
 @api.post("/login", response_model=AuthToken)
 def api_login(body: AuthLogin, request: Request, db=Depends(get_db)):
+    email = (body.email or "").strip().lower()
+    password = body.password or ""
+
+    # --- 1) find user & verify password ---
+    user = db.query(User).filter(User.email.ilike(email)).first()
+    if not user or not user.hashed_password or not verify_password(password, user.hashed_password):
+        # record FAILED login (do not let failures here mask the 401)
+        try:
+            ip, ua = _client_meta(request)
+            db.execute(
+                text("SELECT public.log_auth_event(:email, 'login', FALSE, :ip, :ua)"),
+                {"email": email, "ip": ip, "ua": ua},
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    # --- 2) touch activity (never fail login if this errors) ---
     try:
-        email = (body.email or "").strip().lower()
-        password = body.password or ""
-
-        user = db.query(User).filter(User.email.ilike(email)).first()
-        if not user or not user.hashed_password or not verify_password(password, user.hashed_password):
-            # record failed login
-            try:
-                ip, ua = _client_meta(request)
-                db.execute(
-                    text("SELECT public.log_auth_event(:email, 'login', FALSE, :ip, :ua)"),
-                    {"email": email, "ip": ip, "ua": ua},
-                )
-                db.commit()
-            except Exception:
-                db.rollback()
-            raise HTTPException(status_code=401, detail="Invalid email or password")
-
-        # touch activity
         _touch_user_last_seen(db, user.id)
+    except Exception:
+        db.rollback()
 
-        # create token (keep your existing call style)
-        token = create_access_token(sub=user.email)
+    # --- 3) create JWT ---
+    # Use user.id to be unambiguous; our auth.py accepts id or email in sub.
+    token = create_access_token(sub=user.id)
 
-        # ✅ record successful login
+    # --- 4) record SUCCESS login (never fail the response on logging errors) ---
+    try:
         ip, ua = _client_meta(request)
         db.execute(
             text("SELECT public.log_auth_event(:email, 'login', TRUE, :ip, :ua)"),
             {"email": user.email, "ip": ip, "ua": ua},
         )
         db.commit()
+    except Exception:
+        db.rollback()
 
-        # optional usage log (ignore failures)
-        try:
-            _log_usage(db, user_id=int(user.id), endpoint="/api/login", status_text="ok")
-        except Exception:
-            db.rollback()
+    # --- 5) optional usage log (don't break flow on failures) ---
+    try:
+        _log_usage(db, user_id=int(user.id), endpoint="/api/login", status_text="ok")
+    except Exception:
+        db.rollback()
 
-        return AuthToken(access_token=token)
+    # --- 6) return token AND set cookie so browser sends it automatically ---
+    resp = JSONResponse({"access_token": token})
+    try:
+        # if you imported set_auth_cookie from auth.py
+        from auth import set_auth_cookie
+        set_auth_cookie(resp, token)
+    except Exception:
+        # fall back silently if cookie utility missing
+        pass
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        # record as failed login for observability
-        try:
-            ip, ua = _client_meta(request)
-            db.execute(
-                text("SELECT public.log_auth_event(:email, 'login', FALSE, :ip, :ua)"),
-                {"email": (body.email or "").strip().lower(), "ip": ip, "ua": ua},
-            )
-            db.commit()
-        except Exception:
-            db.rollback()
-        return JSONResponse(status_code=500, content={"detail": "internal_error", "error": str(e)})
+    return resp
 
 @api.get("/profile", response_model=Me)
 def api_profile(current: User = Depends(get_current_user), db=Depends(get_db)):
