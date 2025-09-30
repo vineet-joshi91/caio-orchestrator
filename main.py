@@ -101,8 +101,11 @@ if not allowed:
 allow_origin_regex = (
     r"^(https://caio-frontend\.vercel\.app"
     r"|http://localhost:3000"
-    r"|https://caioai\.netlify\.app)$"
+    r"|https://caioai\.netlify\.app"
+    r"|https://caioinsights\.com"
+    r"|https://www\.caioinsights\.com)$"
 )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -155,9 +158,13 @@ async def _startup():
 # ==============================================================================
 def _log_usage(db, user_id: int, endpoint: str, status_text="ok", meta: str = ""):
     try:
-        # keep your existing UsageLog schema behavior
-        db.add(UsageLog(user_id=user_id, endpoint=endpoint, status=status_text,
-                        tokens_used=0, timestamp=datetime.utcnow(), meta=meta))
+        db.add(UsageLog(
+            user_id=user_id,
+            endpoint=endpoint,
+            status=status_text,
+            timestamp=datetime.utcnow(),
+            meta=meta,
+        ))
         db.commit()
     except Exception:
         db.rollback()
@@ -309,6 +316,18 @@ def api_profile(current: User = Depends(get_current_user), db=Depends(get_db)):
         is_paid=bool(getattr(current, "is_paid", False)),
     )
 
+@app.get("/debug/db")
+def db_debug(db=Depends(get_db)):
+    row = db.execute(text("""
+        SELECT current_database()   AS db,
+               current_setting('neon.project_id', true)  AS neon_project,
+               current_setting('neon.branch_name', true) AS neon_branch,
+               current_schema()      AS schema,
+               now()                 AS server_time
+    """)).mappings().one()
+    users = db.execute(text("SELECT count(*) FROM public.users")).scalar()
+    latest = db.execute(text("SELECT max(timestamp) FROM public.usage_logs")).scalar()
+    return {"info": dict(row), "counts": {"users": users, "usage_logs_latest": str(latest)}}
 
 # ==============================================================================
 # Extraction helpers + formatter
