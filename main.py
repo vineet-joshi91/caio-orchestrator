@@ -227,7 +227,15 @@ def health():
 def api_ready():
     return {"ok": True, "db": DB_READY, "startup": STARTUP_OK}
 
-
+@app.get("/api/profile")
+def profile(current_user=Depends(get_current_user)):
+    return {
+        "email": current_user.email,
+        "tier": getattr(current_user, "tier", "demo"),
+        "is_admin": bool(getattr(current_user, "is_admin", False)),
+        "is_paid": bool(getattr(current_user, "is_paid", False)),
+        "created_at": getattr(current_user, "created_at", None),
+    }
 # ==============================================================================
 # Public Config + Auth/Profile
 # ==============================================================================
