@@ -38,6 +38,7 @@ PAY_INTERVAL_TEXT = os.getenv("PAY_INTERVAL_TEXT", "every 1 monthly")
 
 # Supported tiers
 SUPPORTED_PLANS = ("pro", "pro_plus", "premium")
+TIER_KEYS = {"pro", "pro_plus", "premium"}
 
 # Pricing via env JSON
 # Old shape (still supported, maps to 'pro'): {"INR":{"amount_major":1999,"symbol":"₹"},"USD":{"amount_major":25,"symbol":"$"}}
@@ -61,6 +62,21 @@ def _load_pricing() -> Dict[str, Dict[str, Any]]:
 PRICING = _load_pricing()
 ALLOWED_CURRENCIES = set(PRICING.keys())
 HAS_SECRET = bool(RZP_SECRET)
+
+# Optional (Subscriptions only) – map plan_id -> feature tier
+PLAN_TO_TIER = {
+    # INR
+    os.getenv("RAZORPAY_PLAN_PRO_INR", ""): "pro",
+    os.getenv("RAZORPAY_PLAN_PRO_PLUS_INR", ""): "pro_plus",
+    os.getenv("RAZORPAY_PLAN_PREMIUM_INR", ""): "premium",
+    # USD
+    os.getenv("RAZORPAY_PLAN_PRO_USD", ""): "pro",
+    os.getenv("RAZORPAY_PLAN_PRO_PLUS_USD", ""): "pro_plus",
+    os.getenv("RAZORPAY_PLAN_PREMIUM_USD", ""): "premium",
+}
+
+# Payment Pages: hidden field notes.plan_id values we’ll set on each page
+NOTES_PLAN_MAP = {"pro": "pro", "pro_plus": "pro_plus", "premium": "premium"}
 
 _rzp: Optional["razorpay.Client"] = None
 if razorpay and RZP_KEY_ID and RZP_SECRET:
@@ -158,6 +174,100 @@ def _ensure_plan(currency: str, amount_major: int, plan: str) -> str:
         msg = getattr(e, "args", [str(e)])[0]
         raise HTTPException(502, f"Razorpay server error: {msg}") from e
 
+# ------------------------- DB helpers (idempotency & columns) ----------------
+
+def _ensure_event_table(db: Session) -> None:
+    """Create the idempotency/audit table and user columns if missing."""
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS payments_webhooks (
+          id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          email TEXT,
+          plan_key TEXT,
+          currency TEXT,
+          raw JSONB,
+          created_at TIMESTAMPTZ DEFAULT now()
+        );
+    """)
+    # Add user metadata columns if not present (best replaced with Alembic later)
+    try:
+        db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS feature_tier TEXT;")
+        db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_currency TEXT;")
+    except Exception:
+        pass
+    db.commit()
+
+def _already_processed(event_id: str, db: Session) -> bool:
+    if not event_id:
+        return False
+    row = db.execute("SELECT 1 FROM payments_webhooks WHERE id=:i", {"i": event_id}).fetchone()
+    return bool(row)
+
+def _record_event(event_id: str, provider: str, evtype: str, email: Optional[str],
+                  plan_key: Optional[str], currency: Optional[str], raw: dict, db: Session) -> None:
+    db.execute(
+        """
+        INSERT INTO payments_webhooks (id, provider, event_type, email, plan_key, currency, raw)
+        VALUES (:id, :prov, :ev, :em, :pk, :cur, CAST(:raw AS JSON))
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {"id": event_id or "no-id", "prov": "razorpay", "ev": evtype, "em": email,
+         "pk": plan_key, "cur": currency, "raw": json.dumps(raw)}
+    )
+    db.commit()
+
+# ------------------------- Extractors for webhook ----------------------------
+
+def _extract_email(event: dict) -> Optional[str]:
+    pay = (event.get("payload", {}).get("payment", {}) or {}).get("entity", {}) or {}
+    email = (pay.get("email") or "").strip().lower()
+    if email:
+        return email
+    sub = (event.get("payload", {}).get("subscription", {}) or {}).get("entity", {}) or {}
+    email = ((sub.get("notes") or {}).get("email") or "").strip().lower()
+    if email:
+        return email
+    inv = (event.get("payload", {}).get("invoice", {}) or {}).get("entity", {}) or {}
+    email = ((inv.get("customer_details") or {}).get("email") or "").strip().lower()
+    return email or None
+
+def _extract_currency(event: dict) -> str:
+    pay = (event.get("payload", {}).get("payment", {}) or {}).get("entity", {}) or {}
+    cur = (pay.get("currency") or "").upper()
+    if cur:
+        return cur
+    title = ((event.get("payload", {}).get("payment_page", {}) or {}).get("entity", {}) or {}).get("title", "").lower()
+    if "international" in title or "usd" in title:
+        return "USD"
+    if "india" in title or "inr" in title:
+        return "INR"
+    return ""
+
+def _extract_plan_key(event: dict) -> Optional[str]:
+    # 1) Payment Pages: notes.plan_id
+    pay = (event.get("payload", {}).get("payment", {}) or {}).get("entity", {}) or {}
+    notes = pay.get("notes") or {}
+    n = (notes.get("plan_id") or "").strip().lower()
+    if n in NOTES_PLAN_MAP:
+        return NOTES_PLAN_MAP[n]
+
+    # 2) Subscriptions: map plan_id via env
+    sub = (event.get("payload", {}).get("subscription", {}) or {}).get("entity", {}) or {}
+    plan_id = (sub.get("plan_id") or "").strip()
+    if plan_id in PLAN_TO_TIER:
+        return PLAN_TO_TIER[plan_id]
+
+    # 3) Payment Page title fallback
+    title = ((event.get("payload", {}).get("payment_page", {}) or {}).get("entity", {}) or {}).get("title", "").lower()
+    if "pro+" in title or "pro plus" in title:
+        return "pro_plus"
+    if "premium" in title:
+        return "premium"
+    if "pro" in title:
+        return "pro"
+    return None
+
 # ------------------------- Routes -------------------------------------------
 
 @router.get("/ping")
@@ -216,7 +326,7 @@ def create_subscription(
         sub = _rzp.subscription.create(
             {
                 "plan_id": plan_id,
-                "total_count": 12,
+                "total_count": 12,           # 1 year; adjust as desired
                 "customer_notify": 1,
                 "notes": notes,
             }
@@ -285,57 +395,85 @@ def cancel_subscription(
 @router.post("/razorpay/webhook")
 async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
     """
-    subscription.activated / invoice.paid => user.is_paid = True
-    subscription.cancelled                => user.is_paid = False
+    Handles:
+      - Payment Pages: payment.captured -> set is_paid True, feature_tier, billing_currency
+      - Subscriptions: subscription.activated / invoice.paid -> True
+                       subscription.cancelled -> False
+    Logs every event for idempotency/audit in payments_webhooks.
     """
     if not RZP_WEBHOOK_SECRET:
         raise HTTPException(503, "Webhook secret not configured")
 
+    # Verify HMAC signature
     body = await request.body()
-    signature = request.headers.get("X-Razorpay-Signature", "")
-
-    # Razorpay: HMAC-SHA256 hex digest over raw body
+    signature = request.headers.get("X-Razorpay-Signature", "") or ""
     expected = hmac.new(RZP_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, signature or ""):
+    if not hmac.compare_digest(expected, signature):
         raise HTTPException(401, "Invalid signature")
 
     event = json.loads(body.decode("utf-8"))
     etype = event.get("event", "")
+    event_id = event.get("id", "")
     payload = event.get("payload", {}) or {}
 
-    # Extract user email we put into notes during creation
-    email: Optional[str] = None
-    sub_entity = (payload.get("subscription") or {}).get("entity") or {}
-    email = (sub_entity.get("notes") or {}).get("email") or email
+    _ensure_event_table(db)
+    if _already_processed(event_id, db):
+        return {"ok": True, "duplicate": True}
 
-    inv_entity = (payload.get("invoice") or {}).get("entity") or {}
-    if not email:
-        email = (inv_entity.get("customer_details") or {}).get("email")
+    # Extract attributes used across flows
+    email = _extract_email(event)
+    plan_key = _extract_plan_key(event)   # "pro" | "pro_plus" | "premium" if resolvable
+    currency = _extract_currency(event)   # "INR" | "USD" etc.
+
+    # Always record event (idempotency + audit)
+    _record_event(event_id, "razorpay", etype, email, plan_key, currency, event, db)
+
+    actionable = {
+        # Payment Pages:
+        "payment.captured",
+        "order.paid",
+        "payment.authorized",
+        # Subscriptions:
+        "subscription.activated",
+        "invoice.paid",
+        "subscription.cancelled",
+    }
+
+    if etype not in actionable:
+        return {"ok": True, "note": f"ignored:{etype}"}
 
     if not email:
         log.warning("Webhook %s without resolvable email; payload keys=%s", etype, list(payload.keys()))
         return {"ok": True, "note": "no-email-in-payload"}
 
-    # Update user flag
+    # Load user
     user: Optional[User] = db.query(User).filter(User.email == email).first()
     if not user:
         log.warning("Webhook %s: user not found for email=%s", etype, email)
         return {"ok": True, "note": "user-not-found"}
 
     try:
-        if etype in ("subscription.activated", "invoice.paid"):
+        if etype in ("payment.captured", "order.paid", "payment.authorized", "subscription.activated", "invoice.paid"):
             user.is_paid = True
+            if plan_key in TIER_KEYS:
+                user.feature_tier = plan_key
+            if currency:
+                user.billing_currency = currency
         elif etype in ("subscription.cancelled",):
             user.is_paid = False
-        else:
-            return {"ok": True, "note": f"ignored:{etype}"}
 
         db.add(user); db.commit()
     except Exception as e:
         log.error("Webhook DB update failed: %s", e)
         raise HTTPException(500, "DB update failed")
 
-    return {"ok": True, "email": email, "event": etype}
+    return {
+        "ok": True,
+        "email": email,
+        "event": etype,
+        "feature_tier": getattr(user, "feature_tier", None),
+        "billing_currency": getattr(user, "billing_currency", None),
+    }
 
 # -------------------------- Legacy shim for old frontend ---------------------
 
