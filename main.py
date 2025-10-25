@@ -238,6 +238,12 @@ def health():
 def api_ready():
     return {"ok": True, "db": DB_READY, "startup": STARTUP_OK}
 
+@app.head("/api/ready")
+async def api_ready_head():
+    # For HEAD, we should return 200 with no body.
+    # We still want to signal "I'm alive and DB is up".
+    return Response(status_code=200)
+
 @app.get("/api/profile")
 def profile(current_user=Depends(get_current_user)):
     return {
