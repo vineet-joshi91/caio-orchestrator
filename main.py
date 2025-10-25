@@ -133,8 +133,6 @@ def options_ok(path: str):
     # make preflight succeed
     _set_cors_headers(resp, None)  # browser ignores on OPTIONS without Origin
     return resp
-
-
 # ==============================================================================
 # Startup warmup (DB)
 # ==============================================================================
@@ -237,12 +235,13 @@ def health():
     return Health(status="ok", version=settings.VERSION)
 
 @app.get("/api/ready")
-def api_ready_get():
+def api_ready():
     return {"ok": True, "db": DB_READY, "startup": STARTUP_OK}
 
 @app.head("/api/ready")
 async def api_ready_head():
-    # UptimeRobot free tier sends HEAD. Respond 200/no body so it thinks we're healthy.
+    # For HEAD, we should return 200 with no body.
+    # We still want to signal "I'm alive and DB is up".
     return Response(status_code=200)
 
 @app.get("/api/profile")
@@ -254,8 +253,6 @@ def profile(current_user=Depends(get_current_user)):
         "is_paid": bool(getattr(current_user, "is_paid", False)),
         "created_at": getattr(current_user, "created_at", None),
     }
-
-
 # ==============================================================================
 # Public Config + Auth/Profile
 # ==============================================================================
@@ -434,7 +431,6 @@ def api_logout(response: Response):
         # swallow: logout should never take the app down
         pass
     return JSONResponse({"ok": True})
-
 
 # ==============================================================================
 # Extraction helpers + formatter
@@ -622,143 +618,11 @@ def _format_analyze_to_cxo_md(resp: Dict[str, Any]) -> str:
 # ==============================================================================
 # Analyze core (shared by API + chat)
 # ==============================================================================
-
 DEBUG_VERBOSE = bool(os.getenv("DEBUG_VERBOSE", "0") == "1")
-
-DEMO_CHAR_LIMIT = 2000  # tighter cap for demo/preview so it returns fast
-
-def _shorten_for_demo(text: str) -> str:
-    """
-    Keep demo tier cheap, fast, and predictable.
-    We only show a snippet of the actual document.
-    """
-    if not text:
-        return ""
-    t = text.strip()
-    if len(t) > DEMO_CHAR_LIMIT:
-        t = t[:DEMO_CHAR_LIMIT]
-    return t
-
-async def _run_demo_preview(content: str, filename: str, brief: str) -> Dict[str, Any]:
-    """
-    Lightweight preview for DEMO tier.
-    We do ONE pass instead of all 5 brains to avoid 120s timeouts.
-    We also inject 'Document Validity' / trust check.
-    Returns { "combined": "...human readable text..." }
-    """
-    job_id = str(uuid.uuid4())
-
-    # pick CFO brain as the fastest/most ROI-relevant POV
-    cfo_fn = brain_registry.get("CFO")
-
-    # Build a synthetic prompt-style input for that brain
-    # We are telling it: give high-level + validity audit.
-    brain_input = {
-        "document_excerpt": f"""
-[BEGIN PREVIEW - TRUNCATED FOR DEMO USERS]
-{content}
-[END PREVIEW]
-
-User brief / instructions from uploader:
-{brief}
-
-You ONLY see a partial preview. Some data may be missing.
-""",
-        "tier": "demo",
-        "demo_directives": (
-            "1) EXECUTIVE SUMMARY:\n"
-            "- Brief the founder/CEO: top patterns, opportunities, red flags.\n"
-            "- Keep it practical and punchy.\n\n"
-            "2) DOCUMENT VALIDITY:\n"
-            "- Does the preview look internally consistent, or suspicious / incomplete?\n"
-            "- Call out if numbers feel too 'clean', context is missing, or totals are unverified.\n"
-            "- List 3-5 questions you'd ask the sender to PROVE this data is real.\n\n"
-            "IMPORTANT:\n"
-            "- If you can't confirm something from the preview, say 'not visible in preview'.\n"
-            "- DO NOT invent totals or exact figures you cannot see.\n"
-            "- Mention that full multi-department CAIO review (CFO/COO/CHRO/CMO/CPO) "
-            "is available only on paid plans."
-        )
-    }
-
-    # Try to run CFO brain on this synthetic input.
-    preview_text = ""
-    if cfo_fn:
-        try:
-            out = cfo_fn(brain_input) or {}
-            # The brain might already format summary/recs;
-            # we just stringify it in a CEO-facing block.
-            summary_bits = []
-            # summary / recommendations if present
-            if isinstance(out, dict):
-                if out.get("summary"):
-                    summary_bits.append("EXECUTIVE SUMMARY:\n" + str(out["summary"]).strip())
-                recs = out.get("recommendations") or []
-                if recs:
-                    summary_bits.append(
-                        "TOP ACTIONS / NEXT STEPS:\n" +
-                        "\n".join(f"- {r}" for r in recs[:5])
-                    )
-                # if brain provided validity-style info already (future-proof):
-                if out.get("validity"):
-                    summary_bits.append(
-                        "DOCUMENT VALIDITY:\n" + str(out["validity"]).strip()
-                    )
-            # If CFO brain didn't return structured stuff, fallback to generic text:
-            if not summary_bits:
-                summary_bits.append(
-                    "EXECUTIVE SUMMARY:\n"
-                    "High-level financial / operational perspective could not be fully generated. "
-                    "Upload a cleaner financial summary (P&L, revenue trends, cost lines) for deeper review."
-                )
-            preview_text = "\n\n".join(summary_bits).strip()
-        except Exception as e:
-            # brain call failed. We'll produce a graceful fallback.
-            preview_text = (
-                "EXECUTIVE SUMMARY:\n"
-                "We saw partial data, but couldn't generate full CFO review.\n\n"
-                "DOCUMENT VALIDITY:\n"
-                "We cannot confirm whether this file is internally consistent or trustworthy "
-                "because the automated CFO module errored.\n\n"
-                f"(debug hint: {str(e)[:200]})"
-            )
-    else:
-        # No CFO brain registered at all
-        preview_text = (
-            "EXECUTIVE SUMMARY:\n"
-            "We saw partial data but CFO module is not available.\n\n"
-            "DOCUMENT VALIDITY:\n"
-            "We cannot assert authenticity, completeness, or internal consistency from this preview alone.\n"
-            "Ask for: source docs, date ranges, and unedited exports."
-        )
-
-    # Always attach an upsell hook here
-    upgrade_hint = (
-        "This is a preview based on a partial snippet of your file. "
-        "Upgrade to Pro/Premium to unlock full multi-department CAIO review "
-        "(Finance, Ops, HR, Marketing, Procurement) on the ENTIRE document, "
-        "plus a deeper authenticity / fraud-risk check."
-    )
-
-    return {
-        "job_id": job_id,
-        "tier": "demo",
-        "combined": {
-            "overall_summary": preview_text,
-            "aggregate": {
-                "collective": [],
-                "collective_insights": [],
-                "recommendations_by_role": {"CFO": []},
-            },
-        },
-        "upgrade_hint": upgrade_hint,
-    }
-
 
 async def _run_analyze_from_content(content: str, filename: str, tier: str) -> Dict[str, Any]:
     """
-    Core analyze logic (full multi-brain path for paid tiers).
-    Returns dict: {"job_id": str, "combined": {...}}
+    Core analyze logic. Returns dict: {"job_id": str, "combined": {...}}
     Never raises. Ensures at least 1 recommendation per role and mirrors into details.
     """
     job_id = str(uuid.uuid4())
@@ -869,13 +733,13 @@ async def _run_analyze_from_content(content: str, filename: str, tier: str) -> D
             # Fall back to first recs across roles, labeled
             try:
                 tmp = []
-                recs_by_role2 = (
+                recs_by_role = (
                     agg.get("recommendations_by_role")
                     or agg.get("cxo_recommendations")
                     or {}
                 )
                 for role in ("CFO", "CHRO", "COO", "CMO", "CPO"):
-                    first = (recs_by_role2.get(role) or [None])[0]
+                    first = (recs_by_role.get(role) or [None])[0]
                     if first:
                         tmp.append(f"{role}: {first}")
                     if len(tmp) >= 3:
@@ -921,100 +785,42 @@ async def api_analyze(
     db=Depends(get_db),
     current: User = Depends(get_current_user),
 ):
-    """
-    This endpoint now has a DEMO fast path to avoid frontend 120000ms timeout.
-
-    DEMO tier:
-      - aggressively truncates content (~2K chars)
-      - runs a single lightweight CFO-style preview with validity check
-      - returns immediately with upgrade_hint
-
-    PRO / PREMIUM:
-      - full multi-brain run via _run_analyze_from_content (unchanged behavior)
-    """
-
-    # Figure out content-type / multipart
+    # Normalize input -> content, filename, tier
     ct = (request.headers.get("content-type") or "").lower()
     is_multipart = "multipart/form-data" in ct or (text is not None) or (file is not None) or (files is not None)
 
-    # Determine tier from user
-    tier = (
-        "premium" if getattr(current, "is_admin", False)
-        else ("pro" if getattr(current, "is_paid", False) else "demo")
-    )
+    tier = ("premium" if getattr(current, "is_admin", False)
+            else ("pro" if getattr(current, "is_paid", False) else "demo"))
 
-    # Extract uploaded data -> content, filename
     if is_multipart:
         flist: List[UploadFile] = []
-        if file is not None:
-            flist.append(file)
-        if files:
-            flist.extend(files)
-
+        if file is not None: flist.append(file)
+        if files: flist.extend(files)
         appendix = await _extract_text_from_files(flist)
         content = ((text or "") + (("\n\n" + appendix) if appendix else "")).strip()
-
         filename = "input.txt"
         for f in flist:
             if getattr(f, "filename", None):
                 filename = f.filename
                 break
     else:
-        # JSON body path
         if doc is None:
             try:
                 body = await request.json()
             except Exception:
-                raise HTTPException(
-                    status_code=415,
-                    detail="Unsupported content-type. Send JSON or multipart/form-data.",
-                )
+                raise HTTPException(status_code=415, detail="Unsupported content-type. Send JSON or multipart/form-data.")
             try:
                 doc = DocumentIn(**(body or {}))
             except Exception:
                 raise HTTPException(status_code=422, detail="Invalid payload for DocumentIn.")
-
         content = (doc.content or "").strip()
         filename = doc.filename or "input.txt"
-        # allow client JSON to suggest tier override if present
         tier = (doc.tier or tier).lower()
 
     if not content:
         raise HTTPException(status_code=400, detail="No content provided for analysis.")
 
-    # --- DEMO FAST PATH -------------------------------------------------------
-    if tier.lower() in ("demo", "free"):
-        # Trim/preview for performance under 120s
-        preview_content = _shorten_for_demo(content)
-
-        # The user's original text prompt / question (for context/brief)
-        # NOTE: in multipart flow above, `text` is the "brief / instructions" textarea from dashboard.
-        user_brief = (text or "") if is_multipart else (doc.brief if doc else "")
-
-        demo_result = await _run_demo_preview(
-            content=preview_content,
-            filename=filename,
-            brief=user_brief or "",
-        )
-
-        _touch_user_last_seen(db, current.id)  # bump activity
-        _log_usage(db, current.id, "/api/analyze", "ok")
-
-        # We shape response similar to full path to avoid FE breakage.
-        # "combined" is present, plus "upgrade_hint".
-        return JSONResponse(
-            {
-                "job_id": demo_result.get("job_id"),
-                "tier": "demo",
-                "combined": demo_result.get("combined"),
-                "upgrade_hint": demo_result.get("upgrade_hint"),
-            },
-            status_code=200,
-        )
-
-    # --- FULL PATH (PRO / PREMIUM) -------------------------------------------
     result = await _run_analyze_from_content(content, filename, tier)
-
     _touch_user_last_seen(db, current.id)  # bump activity
     _log_usage(db, current.id, "/api/analyze", "ok")
     return JSONResponse(result, status_code=200)
@@ -1325,14 +1131,12 @@ def admin_users_summary(db=Depends(get_db), current: User = Depends(get_current_
     """)).mappings().one()
     return {k: int(v) for k, v in dict(row).items()}
 
-
 # --- Feature routers (optional) ---
 try:
     from admin_metrics import router as admin_metrics_router
 except Exception as e:
     admin_metrics_router = None
     print("WARNING: admin_metrics NOT loaded:", repr(e))
-
 
 # ==============================================================================
 # Mount routers
